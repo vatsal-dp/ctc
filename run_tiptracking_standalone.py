@@ -99,10 +99,100 @@ def _infer_parent_id(
     return best_parent_id
 
 
-def _build_res_track_rows(final_tracked_tensor: np.ndarray):
+def _track_ids_in_frame(frame: np.ndarray):
+    ids = np.unique(frame)
+    return ids[ids != 0].astype(int)
+
+
+def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray):
+    normalized_tensor = final_tracked_tensor.astype(np.int64, copy=True)
+    frame_count = int(normalized_tensor.shape[2])
+    max_track_id = int(np.max(normalized_tensor)) if normalized_tensor.size else 0
+    parent_map = {}
+
+    # Enforce CTC-style division semantics frame by frame.
+    for frame_idx in range(1, frame_count):
+        prev_frame = normalized_tensor[:, :, frame_idx - 1]
+        curr_frame = normalized_tensor[:, :, frame_idx]
+        prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+        if not prev_ids:
+            continue
+
+        curr_ids = _track_ids_in_frame(curr_frame).tolist()
+        newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
+        if not newborn_ids:
+            continue
+
+        mother_to_newborns = {}
+        for newborn_id in newborn_ids:
+            child_mask = curr_frame == newborn_id
+            mother_id = _infer_parent_id(
+                prev_frame=prev_frame,
+                child_mask=child_mask,
+                child_track_id=newborn_id,
+                valid_track_ids=prev_ids,
+            )
+            if mother_id == 0:
+                continue
+            mother_to_newborns.setdefault(mother_id, []).append(newborn_id)
+
+        if not mother_to_newborns:
+            continue
+
+        curr_id_set = set(curr_ids)
+        for mother_id in sorted(mother_to_newborns):
+            if mother_id not in curr_id_set:
+                continue
+
+            max_track_id += 1
+            continuation_daughter_id = max_track_id
+
+            # Mother must end at f-1, so relabel continuation branch from frame f onward.
+            for time_idx in range(frame_idx, frame_count):
+                frame_t = normalized_tensor[:, :, time_idx]
+                if np.any(frame_t == mother_id):
+                    frame_t = frame_t.copy()
+                    frame_t[frame_t == mother_id] = continuation_daughter_id
+                    normalized_tensor[:, :, time_idx] = frame_t
+
+            parent_map[continuation_daughter_id] = mother_id
+            for newborn_id in sorted(set(mother_to_newborns[mother_id])):
+                parent_map[newborn_id] = mother_id
+
+            curr_id_set.discard(mother_id)
+            curr_id_set.add(continuation_daughter_id)
+
+    return normalized_tensor.astype(np.uint32), parent_map
+
+
+def _reindex_tracks_compact(tracked_tensor: np.ndarray, parent_map: dict[int, int]):
+    track_ids = np.unique(tracked_tensor)
+    track_ids = track_ids[track_ids != 0].astype(int)
+    id_map = {int(old_id): new_id for new_id, old_id in enumerate(track_ids.tolist(), start=1)}
+
+    if len(id_map) > np.iinfo(np.uint16).max:
+        raise ValueError("Track count exceeds uint16 capacity required for challenge mask export.")
+
+    reindexed_tensor = np.zeros_like(tracked_tensor, dtype=np.uint16)
+    for old_id, new_id in id_map.items():
+        reindexed_tensor[tracked_tensor == old_id] = new_id
+
+    remapped_parent_map = {}
+    for child_old_id, parent_old_id in parent_map.items():
+        child_new_id = id_map.get(int(child_old_id))
+        parent_new_id = id_map.get(int(parent_old_id))
+        if child_new_id is None or parent_new_id is None:
+            continue
+        if child_new_id == parent_new_id:
+            continue
+        remapped_parent_map[child_new_id] = parent_new_id
+
+    return reindexed_tensor, id_map, remapped_parent_map
+
+
+def _build_res_track_from_parent_map(final_tracked_tensor: np.ndarray, parent_map: dict[int, int]):
     track_ids = np.unique(final_tracked_tensor)
     track_ids = track_ids[track_ids != 0].astype(int)
-    valid_track_ids = set(track_ids.tolist())
     rows = []
 
     for track_id in track_ids.tolist():
@@ -113,17 +203,9 @@ def _build_res_track_rows(final_tracked_tensor: np.ndarray):
 
         begin_frame = int(frames[0])
         end_frame = int(frames[-1])
-        parent_id = 0
-
-        if begin_frame > 0:
-            child_mask = final_tracked_tensor[:, :, begin_frame] == track_id
-            prev_frame = final_tracked_tensor[:, :, begin_frame - 1]
-            parent_id = _infer_parent_id(
-                prev_frame=prev_frame,
-                child_mask=child_mask,
-                child_track_id=track_id,
-                valid_track_ids=valid_track_ids,
-            )
+        parent_id = int(parent_map.get(track_id, 0))
+        if begin_frame == 0:
+            parent_id = 0
 
         rows.append((track_id, begin_frame, end_frame, parent_id))
 
@@ -166,23 +248,27 @@ def _validate_res_track_rows(final_tracked_tensor: np.ndarray, rows):
 def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray):
     result_dir.mkdir(parents=True, exist_ok=True)
 
+    normalized_tensor, division_parent_map = _normalize_ctc_divisions(final_tracked_tensor)
+    reindexed_tensor, _, remapped_parent_map = _reindex_tracks_compact(normalized_tensor, division_parent_map)
+
     for old_mask in result_dir.glob("mask*.tif"):
         old_mask.unlink()
 
-    for frame_idx in range(final_tracked_tensor.shape[2]):
+    for frame_idx in range(reindexed_tensor.shape[2]):
         tifffile.imwrite(
             str(result_dir / f"mask{frame_idx:03d}.tif"),
-            final_tracked_tensor[:, :, frame_idx].astype(np.uint16),
+            reindexed_tensor[:, :, frame_idx].astype(np.uint16),
         )
 
-    rows = _build_res_track_rows(final_tracked_tensor)
-    _validate_res_track_rows(final_tracked_tensor, rows)
+    rows = _build_res_track_from_parent_map(reindexed_tensor, remapped_parent_map)
+    _validate_res_track_rows(reindexed_tensor, rows)
 
     with (result_dir / "res_track.txt").open("w", encoding="utf-8") as f:
         for track_id, begin_frame, end_frame, parent_id in rows:
             f.write(f"{track_id} {begin_frame} {end_frame} {parent_id}\n")
 
-    return len(rows)
+    final_object_count = int(np.max(reindexed_tensor)) if reindexed_tensor.size else 0
+    return len(rows), final_object_count
 
 
 def _load_mask_stack(mask_dir: Path, mask_pattern: str | None, resiz_factor: float):
@@ -585,11 +671,13 @@ def run_tracking(
             cell_exists[1, seq_id] = int(nz[-1])
 
     final_masks = mask1
-    final_number_objects = int(np.max(final_masks)) if final_masks.size else 0
     final_number_frames = int(final_masks.shape[2])
     final_tracked_tensor = final_masks.astype(np.uint16)
 
-    track_count = _write_challenge_outputs(result_dir=result_dir, final_tracked_tensor=final_tracked_tensor)
+    track_count, final_number_objects = _write_challenge_outputs(
+        result_dir=result_dir,
+        final_tracked_tensor=final_tracked_tensor,
+    )
 
     print(
         f"[TRACKING] END final_objects={final_number_objects} "
