@@ -253,6 +253,16 @@ def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray)
     print("[TRACKING] export: reindexing tracks", flush=True)
     reindexed_tensor, _, remapped_parent_map = _reindex_tracks_compact(normalized_tensor, division_parent_map)
 
+    print("[TRACKING] export: building res_track rows", flush=True)
+    rows = _build_res_track_from_parent_map(reindexed_tensor, remapped_parent_map)
+    print("[TRACKING] export: validating res_track rows", flush=True)
+    _validate_res_track_rows(reindexed_tensor, rows)
+
+    print("[TRACKING] export: writing res_track.txt", flush=True)
+    with (result_dir / "res_track.txt").open("w", encoding="utf-8") as f:
+        for track_id, begin_frame, end_frame, parent_id in rows:
+            f.write(f"{track_id} {begin_frame} {end_frame} {parent_id}\n")
+
     for old_mask in result_dir.glob("mask*.tif"):
         old_mask.unlink()
 
@@ -265,15 +275,6 @@ def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray)
             str(result_dir / f"mask{frame_idx:03d}.tif"),
             reindexed_tensor[:, :, frame_idx].astype(np.uint16),
         )
-
-    print("[TRACKING] export: building res_track rows", flush=True)
-    rows = _build_res_track_from_parent_map(reindexed_tensor, remapped_parent_map)
-    print("[TRACKING] export: validating res_track rows", flush=True)
-    _validate_res_track_rows(reindexed_tensor, rows)
-
-    with (result_dir / "res_track.txt").open("w", encoding="utf-8") as f:
-        for track_id, begin_frame, end_frame, parent_id in rows:
-            f.write(f"{track_id} {begin_frame} {end_frame} {parent_id}\n")
 
     final_object_count = int(np.max(reindexed_tensor)) if reindexed_tensor.size else 0
     return len(rows), final_object_count
