@@ -248,19 +248,27 @@ def _validate_res_track_rows(final_tracked_tensor: np.ndarray, rows):
 def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray):
     result_dir.mkdir(parents=True, exist_ok=True)
 
+    print("[TRACKING] export: normalizing CTC divisions", flush=True)
     normalized_tensor, division_parent_map = _normalize_ctc_divisions(final_tracked_tensor)
+    print("[TRACKING] export: reindexing tracks", flush=True)
     reindexed_tensor, _, remapped_parent_map = _reindex_tracks_compact(normalized_tensor, division_parent_map)
 
     for old_mask in result_dir.glob("mask*.tif"):
         old_mask.unlink()
 
+    total_frames = int(reindexed_tensor.shape[2])
+    print(f"[TRACKING] export: writing {total_frames} mask files", flush=True)
     for frame_idx in range(reindexed_tensor.shape[2]):
+        if frame_idx % 250 == 0 or frame_idx == total_frames - 1:
+            print(f"[TRACKING] export frame {frame_idx + 1}/{total_frames}", flush=True)
         tifffile.imwrite(
             str(result_dir / f"mask{frame_idx:03d}.tif"),
             reindexed_tensor[:, :, frame_idx].astype(np.uint16),
         )
 
+    print("[TRACKING] export: building res_track rows", flush=True)
     rows = _build_res_track_from_parent_map(reindexed_tensor, remapped_parent_map)
+    print("[TRACKING] export: validating res_track rows", flush=True)
     _validate_res_track_rows(reindexed_tensor, rows)
 
     with (result_dir / "res_track.txt").open("w", encoding="utf-8") as f:
@@ -617,18 +625,23 @@ def run_tracking(
         downsiz = np.array([0], dtype=int)
         dz = 1
 
+    print("[TRACKING] post: preparing downsampled mask stack", flush=True)
     mask0 = masks[:, :, downsiz].astype(np.uint16).copy()
     max_id = int(np.max(mask0)) if np.max(mask0) > 0 else 0
     numb_m1 = int(mask0.shape[2])
     tp_im = np.zeros((max_id, numb_m1), dtype=np.int64)
     if max_id > 0:
+        print(f"[TRACKING] post: building temporal presence table for {numb_m1} frames", flush=True)
         for ih in range(numb_m1):
+            if ih % 250 == 0 or ih == numb_m1 - 1:
+                print(f"[TRACKING] post frame {ih + 1}/{numb_m1}", flush=True)
             counts = np.bincount(mask0[:, :, ih].ravel(), minlength=max_id + 1)
             tp_im[:, ih] = counts[1:]
 
     obj = np.unique(mask0[mask0 != 0]).astype(int)
     tp1 = (tp_im != 0).astype(np.uint8)
 
+    print(f"[TRACKING] post: resolving discontinuous tracks across {len(obj)} objects", flush=True)
     for cel1 in obj:
         if cel1 <= 0 or cel1 > tp1.shape[0]:
             continue
@@ -657,6 +670,7 @@ def run_tracking(
     obj_cor = (np.where(np.sum(tp2, axis=1) >= time_series_threshold)[0] + 1).astype(int)
     no_obj = int(len(obj_cor))
 
+    print(f"[TRACKING] post: compacting surviving tracks to {no_obj} objects", flush=True)
     mask1 = np.zeros_like(mask0, dtype=np.uint16)
     all_ob = np.zeros((no_obj, numb_m1), dtype=np.int64)
     for seq_id, raw_id in enumerate(obj_cor, start=1):
