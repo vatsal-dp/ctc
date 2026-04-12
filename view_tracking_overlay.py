@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tifffile
 from matplotlib.colors import hsv_to_rgb
-from matplotlib.widgets import Button
+from matplotlib.widgets import Slider
 
 
 def _natural_sort_key(text: str):
@@ -88,33 +88,47 @@ class OverlayViewer:
         self.alpha = alpha
         self.frame_count = min(len(image_files), len(mask_files))
         self.index = max(0, min(start_index, self.frame_count - 1))
+        self.frame_slider = None
 
         self.fig, self.ax = plt.subplots(figsize=(10, 8))
-        plt.subplots_adjust(bottom=0.16)
+        plt.subplots_adjust(bottom=0.18)
 
-        prev_ax = self.fig.add_axes([0.33, 0.04, 0.14, 0.07])
-        next_ax = self.fig.add_axes([0.53, 0.04, 0.14, 0.07])
-        self.prev_button = Button(prev_ax, "Prev")
-        self.next_button = Button(next_ax, "Next")
-        self.prev_button.on_clicked(self._on_prev)
-        self.next_button.on_clicked(self._on_next)
+        if self.frame_count > 1:
+            slider_ax = self.fig.add_axes([0.16, 0.06, 0.68, 0.05])
+            self.frame_slider = Slider(
+                ax=slider_ax,
+                label="Frame",
+                valmin=1,
+                valmax=self.frame_count,
+                valinit=self.index + 1,
+                valstep=1,
+            )
+            self.frame_slider.on_changed(self._on_slider_changed)
+
         self.fig.canvas.mpl_connect("key_press_event", self._on_keypress)
 
         self._draw_frame()
 
-    def _on_prev(self, _event):
-        self.index = (self.index - 1) % self.frame_count
+    def _set_index(self, new_index: int, sync_slider: bool):
+        clamped_index = max(0, min(new_index, self.frame_count - 1))
+        if clamped_index == self.index:
+            return
+
+        self.index = clamped_index
+        if sync_slider and self.frame_slider is not None:
+            self.frame_slider.set_val(self.index + 1)
+            return
+
         self._draw_frame()
 
-    def _on_next(self, _event):
-        self.index = (self.index + 1) % self.frame_count
-        self._draw_frame()
+    def _on_slider_changed(self, value):
+        self._set_index(int(value) - 1, sync_slider=False)
 
     def _on_keypress(self, event):
         if event.key in {"left", "a"}:
-            self._on_prev(event)
+            self._set_index(self.index - 1, sync_slider=True)
         elif event.key in {"right", "d"}:
-            self._on_next(event)
+            self._set_index(self.index + 1, sync_slider=True)
 
     def _draw_frame(self):
         image_path = self.image_files[self.index]
