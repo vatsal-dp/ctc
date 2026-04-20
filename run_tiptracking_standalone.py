@@ -19,6 +19,40 @@ def _natural_sort_key(text: str):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
+def _ctc_time_digits_from_name(filename: str):
+    match = re.match(r"^(?:mask|t|man_track|man_seg)(\d+)\.tiff?$", filename, flags=re.IGNORECASE)
+    if match is None:
+        return None
+
+    digit_count = len(match.group(1))
+    if digit_count in {3, 4}:
+        return digit_count
+    return None
+
+
+def _resolve_output_digits(output_digits: str, input_files: list[Path], frame_count: int) -> int:
+    if output_digits != "auto":
+        digits = int(output_digits)
+    else:
+        inferred = {_ctc_time_digits_from_name(path.name) for path in input_files}
+        inferred.discard(None)
+        if len(inferred) == 1 and frame_count <= 10 ** next(iter(inferred)):
+            digits = int(next(iter(inferred)))
+        elif frame_count > 1000:
+            digits = 4
+        else:
+            digits = 3
+
+    if digits not in {3, 4}:
+        raise ValueError("--output-digits must resolve to 3 or 4.")
+    if frame_count > 10**digits:
+        raise ValueError(
+            f"Cannot export {frame_count} frames with {digits} digits. "
+            "Use --output-digits 4 for sequences with more than 1000 frames."
+        )
+    return digits
+
+
 def binar(mask):
     mask_bin = mask.copy()
     mask_bin[mask != 0] = 1
@@ -245,7 +279,7 @@ def _validate_res_track_rows(final_tracked_tensor: np.ndarray, rows):
             raise ValueError(f"Track {track_id} has invalid parent ID {parent_id}.")
 
 
-def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray):
+def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray, output_digits: int):
     result_dir.mkdir(parents=True, exist_ok=True)
 
     print("[TRACKING] export: normalizing CTC divisions", flush=True)
@@ -267,12 +301,15 @@ def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray)
         old_mask.unlink()
 
     total_frames = int(reindexed_tensor.shape[2])
+    if total_frames > 10**output_digits:
+        raise ValueError(f"Cannot write {total_frames} frames with {output_digits}-digit CTC indices.")
+
     print(f"[TRACKING] export: writing {total_frames} mask files", flush=True)
     for frame_idx in range(reindexed_tensor.shape[2]):
         if frame_idx % 250 == 0 or frame_idx == total_frames - 1:
             print(f"[TRACKING] export frame {frame_idx + 1}/{total_frames}", flush=True)
         tifffile.imwrite(
-            str(result_dir / f"mask{frame_idx:03d}.tif"),
+            str(result_dir / f"mask{frame_idx:0{output_digits}d}.tif"),
             reindexed_tensor[:, :, frame_idx].astype(np.uint16),
         )
 
@@ -333,6 +370,7 @@ def run_tracking(
     down_factor: int,
     resiz_factor: float,
     strict_matlab_id_matching: bool,
+    output_digits: str,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     if down_factor != 1:
@@ -347,6 +385,7 @@ def run_tracking(
     im_no = len(masks_tensor)
     if im_no == 0:
         raise RuntimeError("No mask files loaded.")
+    resolved_output_digits = _resolve_output_digits(output_digits, files, im_no)
 
     manifest_path = output_dir / f"{pos}_tracking_input_manifest.txt"
     with manifest_path.open("w", encoding="utf-8") as f:
@@ -356,12 +395,16 @@ def run_tracking(
         f.write(f"result_dir={result_dir}\n")
         f.write(f"matched_pattern={matched_pattern}\n")
         f.write(f"mask_count={len(files)}\n")
+        f.write(f"output_digits={resolved_output_digits}\n")
         f.write("mask_files:\n")
         for p in files:
             f.write(f"  {p.name}\n")
 
     print(f"[TRACKING] START mask_dir={mask_dir} output_dir={output_dir} result_dir={result_dir}")
-    print(f"[TRACKING] loaded_masks={im_no} matched_pattern={matched_pattern}")
+    print(
+        f"[TRACKING] loaded_masks={im_no} matched_pattern={matched_pattern} "
+        f"output_digits={resolved_output_digits}"
+    )
 
     is1 = np.copy(masks_tensor[0]).astype(np.uint16)
     masks = np.zeros((is1.shape[0], is1.shape[1], im_no), dtype=np.uint16)
@@ -692,6 +735,7 @@ def run_tracking(
     track_count, final_number_objects = _write_challenge_outputs(
         result_dir=result_dir,
         final_tracked_tensor=final_tracked_tensor,
+        output_digits=resolved_output_digits,
     )
 
     print(
@@ -729,6 +773,12 @@ def parse_args():
     parser.add_argument("--time-series-threshold", type=int, default=1)
     parser.add_argument("--down-factor", type=int, default=1)
     parser.add_argument("--resiz-factor", type=float, default=1.0)
+    parser.add_argument(
+        "--output-digits",
+        choices=["auto", "3", "4"],
+        default="auto",
+        help="Digits used for CTC maskT.tif output names: auto, 3, or 4 (default: auto).",
+    )
     parser.add_argument("--strict-matlab-id-matching", dest="strict_matlab_id_matching", action="store_true")
     parser.add_argument("--no-strict-matlab-id-matching", dest="strict_matlab_id_matching", action="store_false")
     parser.set_defaults(strict_matlab_id_matching=True)
@@ -763,6 +813,7 @@ def main():
         down_factor=args.down_factor,
         resiz_factor=args.resiz_factor,
         strict_matlab_id_matching=args.strict_matlab_id_matching,
+        output_digits=args.output_digits,
     )
 
 
