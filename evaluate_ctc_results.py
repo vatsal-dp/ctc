@@ -10,10 +10,49 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from validate_ctc_result_format import ValidationError, _normalize_sequence, resolve_digits, validate_ctc_result_format
-
-
 METRICS = ("TRA", "SEG", "DET")
+
+TRA_DET_SECTIONS = {
+    "TRA": (
+        "Splitting Operations",
+        "False Negative Vertices",
+        "False Positive Vertices",
+        "Redundant Edges To Be Deleted",
+        "Edges To Be Added",
+        "Edges with Wrong Semantics",
+    ),
+    "DET": (
+        "Splitting Operations",
+        "False Negative Vertices",
+        "False Positive Vertices",
+    ),
+}
+
+SECTION_SLUGS = {
+    "Splitting Operations": "splitting_operations",
+    "False Negative Vertices": "false_negative_vertices",
+    "False Positive Vertices": "false_positive_vertices",
+    "Redundant Edges To Be Deleted": "redundant_edges_to_be_deleted",
+    "Edges To Be Added": "edges_to_be_added",
+    "Edges with Wrong Semantics": "edges_with_wrong_semantics",
+}
+
+SECTION_RE = re.compile(r"^-+(?P<title>.*?)(?:\s*\(Penalty=(?P<penalty>[^)]+)\))?-+\s*$")
+SCORE_RE = re.compile(
+    r"\b(?P<metric>TRA|DET|SEG)\s+measure:\s*(?P<score>[-+]?(?:\d+\.\d+|\d+)(?:[eE][-+]?\d+)?)",
+    re.IGNORECASE,
+)
+SEG_FRAME_RE = re.compile(r"^-+T=(?P<t>\d+)(?:\s+Z=(?P<z>-?\d+))?-+\s*$")
+SEG_OBJECT_RE = re.compile(
+    r"^GT_label=(?P<gt_label>\d+)\s+J=(?P<jaccard>[-+]?(?:\d+\.\d+|\d+)(?:[eE][-+]?\d+)?)$"
+)
+
+
+def _normalize_sequence(sequence: str) -> str:
+    text = str(sequence)
+    if text.isdigit():
+        return f"{int(text):02d}"
+    return text
 
 
 def _platform_folder() -> str:
@@ -78,6 +117,262 @@ def parse_score(stdout: str):
     if not numbers:
         return None
     return float(numbers[-1])
+
+
+def parse_official_score(text: str, metric: str | None = None):
+    metric = metric.upper() if metric is not None else None
+    matches = list(SCORE_RE.finditer(text))
+    if metric is not None:
+        matches = [match for match in matches if match.group("metric").upper() == metric]
+    if not matches:
+        return None
+    return float(matches[-1].group("score"))
+
+
+def _sequence_from_result_dir(result_dir: Path) -> str:
+    return result_dir.name[: -len("_RES")] if result_dir.name.endswith("_RES") else result_dir.name
+
+
+def _format_float(value):
+    if value is None:
+        return ""
+    return f"{value:.12g}"
+
+
+def _parse_penalty(value: str | None):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def parse_tra_det_log(log_path: Path, metric: str):
+    metric = metric.upper()
+    if metric not in TRA_DET_SECTIONS:
+        raise ValueError(f"TRA/DET log parser does not support metric {metric!r}.")
+
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    score = parse_official_score(text, metric)
+    sequence = _sequence_from_result_dir(log_path.parent)
+    expected_sections = TRA_DET_SECTIONS[metric]
+    counts = {section: 0 for section in expected_sections}
+    penalties = {section: None for section in expected_sections}
+
+    current_section = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("="):
+            current_section = None
+            continue
+
+        header = SECTION_RE.match(line)
+        if header:
+            title = header.group("title").strip()
+            if title in counts:
+                current_section = title
+                penalties[title] = _parse_penalty(header.group("penalty"))
+            else:
+                current_section = None
+            continue
+
+        if current_section is not None:
+            counts[current_section] += 1
+
+    rows = []
+    for section in expected_sections:
+        penalty = penalties[section]
+        count = counts[section]
+        rows.append(
+            {
+                "sequence": sequence,
+                "metric": metric,
+                "official_score": _format_float(score),
+                "penalty_type": SECTION_SLUGS[section],
+                "penalty_label": section,
+                "penalty": _format_float(penalty),
+                "count": count,
+                "weighted_penalty": _format_float(None if penalty is None else penalty * count),
+                "log_path": str(log_path),
+            }
+        )
+    return rows
+
+
+def parse_seg_log(log_path: Path, low_jaccard_threshold: float = 0.5):
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    score = parse_official_score(text, "SEG")
+    sequence = _sequence_from_result_dir(log_path.parent)
+
+    current_t = ""
+    current_z = ""
+    low_rows = []
+    object_count = 0
+    low_count = 0
+    zero_count = 0
+    min_jaccard = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        frame = SEG_FRAME_RE.match(line)
+        if frame:
+            current_t = frame.group("t")
+            current_z = frame.group("z") or ""
+            continue
+
+        match = SEG_OBJECT_RE.match(line)
+        if not match:
+            continue
+
+        object_count += 1
+        jaccard = float(match.group("jaccard"))
+        min_jaccard = jaccard if min_jaccard is None else min(min_jaccard, jaccard)
+        if jaccard == 0:
+            zero_count += 1
+        if jaccard < low_jaccard_threshold:
+            low_count += 1
+            low_rows.append(
+                {
+                    "sequence": sequence,
+                    "official_score": _format_float(score),
+                    "t": current_t,
+                    "z": current_z,
+                    "gt_label": match.group("gt_label"),
+                    "jaccard": _format_float(jaccard),
+                    "threshold": _format_float(low_jaccard_threshold),
+                    "log_path": str(log_path),
+                }
+            )
+
+    summary = {
+        "sequence": sequence,
+        "metric": "SEG",
+        "official_score": _format_float(score),
+        "objects": object_count,
+        "low_jaccard_objects": low_count,
+        "zero_jaccard_objects": zero_count,
+        "min_jaccard": _format_float(min_jaccard),
+        "threshold": _format_float(low_jaccard_threshold),
+        "log_path": str(log_path),
+    }
+    return low_rows, summary
+
+
+def find_result_dirs(dataset_root: Path, sequences: list[str] | None = None):
+    if sequences is None:
+        result_dirs = sorted(
+            path for path in dataset_root.iterdir() if path.is_dir() and path.name.endswith("_RES")
+        )
+    else:
+        result_dirs = [dataset_root / f"{_normalize_sequence(sequence)}_RES" for sequence in sequences]
+    return [path for path in result_dirs if path.is_dir()]
+
+
+def summarize_official_logs(
+    dataset_root: Path,
+    sequences: list[str] | None = None,
+    low_jaccard_threshold: float = 0.5,
+):
+    result_dirs = find_result_dirs(dataset_root, sequences)
+    tra_rows = []
+    det_rows = []
+    seg_low_rows = []
+    seg_summary_rows = []
+
+    for result_dir in result_dirs:
+        tra_log = result_dir / "TRA_log.txt"
+        if tra_log.is_file():
+            tra_rows.extend(parse_tra_det_log(tra_log, "TRA"))
+
+        det_log = result_dir / "DET_log.txt"
+        if det_log.is_file():
+            det_rows.extend(parse_tra_det_log(det_log, "DET"))
+
+        seg_log = result_dir / "SEG_log.txt"
+        if seg_log.is_file():
+            low_rows, summary = parse_seg_log(seg_log, low_jaccard_threshold=low_jaccard_threshold)
+            seg_low_rows.extend(low_rows)
+            seg_summary_rows.append(summary)
+
+    outputs = {
+        "tra_penalties": dataset_root / "ctc_TRA_penalty_counts.csv",
+        "det_penalties": dataset_root / "ctc_DET_penalty_counts.csv",
+        "seg_low_jaccard": dataset_root / "ctc_SEG_low_jaccard_objects.csv",
+        "seg_summary": dataset_root / "ctc_SEG_summary.csv",
+    }
+
+    _write_csv(
+        outputs["tra_penalties"],
+        [
+            "sequence",
+            "metric",
+            "official_score",
+            "penalty_type",
+            "penalty_label",
+            "penalty",
+            "count",
+            "weighted_penalty",
+            "log_path",
+        ],
+        tra_rows,
+    )
+    _write_csv(
+        outputs["det_penalties"],
+        [
+            "sequence",
+            "metric",
+            "official_score",
+            "penalty_type",
+            "penalty_label",
+            "penalty",
+            "count",
+            "weighted_penalty",
+            "log_path",
+        ],
+        det_rows,
+    )
+    _write_csv(
+        outputs["seg_low_jaccard"],
+        ["sequence", "official_score", "t", "z", "gt_label", "jaccard", "threshold", "log_path"],
+        seg_low_rows,
+    )
+    _write_csv(
+        outputs["seg_summary"],
+        [
+            "sequence",
+            "metric",
+            "official_score",
+            "objects",
+            "low_jaccard_objects",
+            "zero_jaccard_objects",
+            "min_jaccard",
+            "threshold",
+            "log_path",
+        ],
+        seg_summary_rows,
+    )
+
+    return {
+        "result_dirs": result_dirs,
+        "outputs": outputs,
+        "tra_rows": len(tra_rows),
+        "det_rows": len(det_rows),
+        "seg_low_rows": len(seg_low_rows),
+        "seg_summary_rows": len(seg_summary_rows),
+    }
+
+
+def _write_csv(path: Path, fieldnames: list[str], rows: list[dict]):
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _symlink(src: Path, dst: Path):
@@ -153,6 +448,12 @@ def run_metric(
     log_path = result_dir / log_name
     archived_log = ""
     if log_path.is_file():
+        official_score = parse_official_score(
+            log_path.read_text(encoding="utf-8", errors="replace"),
+            metric,
+        )
+        if official_score is not None:
+            score = official_score
         archive_dir = result_dir / "ctc_metric_logs"
         archive_dir.mkdir(exist_ok=True)
         archived = archive_dir / log_name
@@ -176,7 +477,12 @@ def parse_args():
         type=Path,
         help="Optional original CTC root containing <sequence>_GT if GT is not beside results.",
     )
-    parser.add_argument("--sequence", required=True, type=str, help="CTC sequence ID, e.g. 01 or 02.")
+    parser.add_argument(
+        "--sequence",
+        default=None,
+        type=str,
+        help="CTC sequence ID, e.g. 01 or 02. Required unless --parse-logs-only is used.",
+    )
     parser.add_argument("--digits", default="auto", choices=["auto", "3", "4"], help="CTC time index digits.")
     parser.add_argument(
         "--ctc-software-dir",
@@ -202,15 +508,42 @@ def parse_args():
         action="store_true",
         help="Skip validate_ctc_result_format.py before running metrics.",
     )
+    parser.add_argument(
+        "--parse-logs-only",
+        action="store_true",
+        help="Skip metric execution and only write CSV summaries from existing official logs.",
+    )
+    parser.add_argument(
+        "--seg-low-jaccard-threshold",
+        default=0.5,
+        type=float,
+        help="SEG objects below this official Jaccard value are written to ctc_SEG_low_jaccard_objects.csv.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    sequence = _normalize_sequence(args.sequence)
     dataset_root = args.dataset_root.resolve()
     source_root = args.source_root.resolve() if args.source_root is not None else None
+    sequence = _normalize_sequence(args.sequence) if args.sequence is not None else None
+
+    if args.parse_logs_only:
+        log_summary = summarize_official_logs(
+            dataset_root=dataset_root,
+            sequences=[sequence] if sequence is not None else None,
+            low_jaccard_threshold=args.seg_low_jaccard_threshold,
+        )
+        print(f"[CTC EVAL] parsed official logs from {len(log_summary['result_dirs'])} result folder(s)")
+        for path in log_summary["outputs"].values():
+            print(f"[CTC EVAL] wrote {path}")
+        return 0
+
+    if sequence is None:
+        raise SystemExit("[CTC EVAL] --sequence is required unless --parse-logs-only is used.")
     result_dir = dataset_root / f"{sequence}_RES"
+
+    from validate_ctc_result_format import ValidationError, resolve_digits, validate_ctc_result_format
 
     digits = resolve_digits(args.digits, dataset_root, source_root, sequence)
     if not args.skip_format_validation:
@@ -254,15 +587,20 @@ def main():
             temp_root.cleanup()
 
     summary_path = result_dir / "ctc_metrics_summary.csv"
-    with summary_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["metric", "score", "stdout_log", "ctc_log"])
-        writer.writeheader()
-        writer.writerows(rows)
+    _write_csv(summary_path, ["metric", "score", "stdout_log", "ctc_log"], rows)
+
+    log_summary = summarize_official_logs(
+        dataset_root=dataset_root,
+        low_jaccard_threshold=args.seg_low_jaccard_threshold,
+    )
 
     for row in rows:
         score = row["score"] if row["score"] else "unparsed"
         print(f"[CTC EVAL] {row['metric']}={score}")
     print(f"[CTC EVAL] wrote {summary_path}")
+    print(f"[CTC EVAL] parsed official logs from {len(log_summary['result_dirs'])} result folder(s)")
+    for path in log_summary["outputs"].values():
+        print(f"[CTC EVAL] wrote {path}")
     return 0
 
 
