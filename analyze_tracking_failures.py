@@ -495,7 +495,7 @@ def parse_args():
     parser.add_argument("--source-root", required=True, type=Path, help="Original CTC dataset root containing GT.")
     parser.add_argument("--sequence", required=True, type=str, help="CTC sequence ID, e.g. 01 or 02.")
     parser.add_argument("--out", required=True, type=Path, help="Output folder for CSVs and thumbnails.")
-    parser.add_argument("--digits", default="auto", choices=["auto", "3", "4"], help="CTC time index digits.")
+    parser.add_argument("--digits", default="auto", help="CTC time index digits: auto or a positive integer.")
     parser.add_argument("--coverage-threshold", default=0.5, type=float, help="GT marker/segment coverage threshold.")
     parser.add_argument("--iou-threshold", default=0.5, type=float, help="GT SEG IoU threshold.")
     parser.add_argument("--split-coverage-threshold", default=0.2, type=float)

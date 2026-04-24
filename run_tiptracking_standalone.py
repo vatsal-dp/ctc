@@ -24,31 +24,43 @@ def _ctc_time_digits_from_name(filename: str):
     if match is None:
         return None
 
-    digit_count = len(match.group(1))
-    if digit_count in {3, 4}:
-        return digit_count
-    return None
+    return len(match.group(1))
+
+
+def _minimum_ctc_digit_width(frame_count: int) -> int:
+    if frame_count < 0:
+        raise ValueError("frame_count must be non-negative.")
+    highest_index = max(frame_count - 1, 0)
+    return max(3, len(str(highest_index)))
+
+
+def _parse_digit_arg(digits_arg: str, option_name: str) -> int:
+    try:
+        digits = int(digits_arg)
+    except ValueError as exc:
+        raise ValueError(f"{option_name} must be 'auto' or a positive integer.") from exc
+    if digits < 1:
+        raise ValueError(f"{option_name} must be a positive integer.")
+    return digits
 
 
 def _resolve_output_digits(output_digits: str, input_files: list[Path], frame_count: int) -> int:
+    required_digits = _minimum_ctc_digit_width(frame_count)
+
     if output_digits != "auto":
-        digits = int(output_digits)
+        digits = _parse_digit_arg(output_digits, "--output-digits")
     else:
         inferred = {_ctc_time_digits_from_name(path.name) for path in input_files}
         inferred.discard(None)
-        if len(inferred) == 1 and frame_count <= 10 ** next(iter(inferred)):
-            digits = int(next(iter(inferred)))
-        elif frame_count > 1000:
-            digits = 4
+        if len(inferred) == 1:
+            digits = max(required_digits, int(next(iter(inferred))))
         else:
-            digits = 3
+            digits = required_digits
 
-    if digits not in {3, 4}:
-        raise ValueError("--output-digits must resolve to 3 or 4.")
     if frame_count > 10**digits:
         raise ValueError(
             f"Cannot export {frame_count} frames with {digits} digits. "
-            "Use --output-digits 4 for sequences with more than 1000 frames."
+            f"Use --output-digits {required_digits} or higher."
         )
     return digits
 
@@ -787,9 +799,8 @@ def parse_args():
     parser.add_argument("--resiz-factor", type=float, default=1.0)
     parser.add_argument(
         "--output-digits",
-        choices=["auto", "3", "4"],
         default="auto",
-        help="Digits used for CTC maskT.tif output names: auto, 3, or 4 (default: auto).",
+        help="Digits used for CTC maskT.tif output names: auto or a positive integer (default: auto).",
     )
     parser.add_argument("--strict-matlab-id-matching", dest="strict_matlab_id_matching", action="store_true")
     parser.add_argument("--no-strict-matlab-id-matching", dest="strict_matlab_id_matching", action="store_false")

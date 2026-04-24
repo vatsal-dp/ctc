@@ -483,7 +483,7 @@ def parse_args():
         type=str,
         help="CTC sequence ID, e.g. 01 or 02. Required unless --parse-logs-only is used.",
     )
-    parser.add_argument("--digits", default="auto", choices=["auto", "3", "4"], help="CTC time index digits.")
+    parser.add_argument("--digits", default="auto", help="CTC time index digits: auto or a positive integer.")
     parser.add_argument(
         "--ctc-software-dir",
         default=None,

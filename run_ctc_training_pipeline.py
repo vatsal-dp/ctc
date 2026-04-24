@@ -227,8 +227,8 @@ def parse_args():
         ),
     )
     parser.add_argument("--time-series-threshold", default=1, type=int)
-    parser.add_argument("--output-digits", choices=["auto", "3", "4"], default="auto")
-    parser.add_argument("--digits", choices=["auto", "3", "4"], default="auto", help="CTC evaluation digit width.")
+    parser.add_argument("--output-digits", default="auto", help="Tracking export width: auto or a positive integer.")
+    parser.add_argument("--digits", default="auto", help="CTC evaluation digit width: auto or a positive integer.")
     parser.add_argument("--metrics", nargs="+", choices=METRICS, default=list(METRICS))
     parser.add_argument(
         "--det-penalize-extra-detections",

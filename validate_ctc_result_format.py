@@ -38,9 +38,7 @@ def _time_digits_from_name(filename: str, prefixes: tuple[str, ...]):
         match = re.match(rf"^{re.escape(prefix)}(\d+)\.tiff?$", filename, flags=re.IGNORECASE)
         if match is None:
             continue
-        width = len(match.group(1))
-        if width in {3, 4}:
-            return width
+        return len(match.group(1))
     return None
 
 
@@ -52,9 +50,19 @@ def infer_digits_from_files(files: list[Path], prefixes: tuple[str, ...]):
     return None
 
 
+def _parse_digits_arg(digits_arg: str) -> int:
+    try:
+        digits = int(digits_arg)
+    except ValueError as exc:
+        raise ValidationError("--digits must be 'auto' or a positive integer.") from exc
+    if digits < 1:
+        raise ValidationError("--digits must be a positive integer.")
+    return digits
+
+
 def resolve_digits(digits_arg: str, dataset_root: Path, source_root: Path | None, sequence: str) -> int:
     if digits_arg != "auto":
-        return int(digits_arg)
+        return _parse_digits_arg(digits_arg)
 
     search_roots = []
     if source_root is not None:
@@ -81,9 +89,7 @@ def resolve_digits(digits_arg: str, dataset_root: Path, source_root: Path | None
         if inferred is not None:
             return int(inferred)
 
-    raise ValidationError(
-        "Could not infer CTC digit width. Pass --digits 3 or --digits 4 explicitly."
-    )
+    raise ValidationError("Could not infer CTC digit width. Pass --digits <n> explicitly.")
 
 
 def _read_tiff(path: Path):
@@ -208,9 +214,6 @@ def validate_ctc_result_format(
         raise ValidationError(f"Expected result folder does not exist: {result_dir}")
 
     digits = resolve_digits(digits_arg, dataset_root, source_root, sequence)
-    if digits not in {3, 4}:
-        raise ValidationError("--digits must resolve to 3 or 4.")
-
     mask_files = _parse_indexed_files(result_dir, "mask", digits)
     _require_contiguous_indices(mask_files, "mask")
 
@@ -324,7 +327,7 @@ def parse_args():
         help="Optional original CTC dataset root containing <sequence>/ source frames.",
     )
     parser.add_argument("--sequence", required=True, type=str, help="CTC sequence ID, e.g. 01 or 02.")
-    parser.add_argument("--digits", default="auto", choices=["auto", "3", "4"], help="CTC time index digits.")
+    parser.add_argument("--digits", default="auto", help="CTC time index digits: auto or a positive integer.")
     parser.add_argument(
         "--allow-non-uint16",
         action="store_true",
