@@ -341,7 +341,7 @@ def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray,
     return len(rows), final_object_count
 
 
-def _load_mask_stack(mask_dir: Path, mask_pattern: str | None, resiz_factor: float):
+def _resolve_mask_files(mask_dir: Path, mask_pattern: str | None):
     if mask_pattern:
         if any(ch in mask_pattern for ch in ["*", "?", "["]):
             files = sorted(mask_dir.glob(mask_pattern), key=lambda p: _natural_sort_key(p.name))
@@ -369,20 +369,20 @@ def _load_mask_stack(mask_dir: Path, mask_pattern: str | None, resiz_factor: flo
                 "No mask files found. Searched for *_cp_masks.tif, *_omni5_masks.tif, *_ART_masks.tif, *_masks.tif"
             )
 
-    masks_tensor = []
-    for p in files:
-        mask = tifffile.imread(str(p)).astype(np.uint16)
-        if resiz_factor != 1.0:
-            mask = resize(
-                mask,
-                (int(round(mask.shape[0] * resiz_factor)), int(round(mask.shape[1] * resiz_factor))),
-                order=0,
-                preserve_range=True,
-                anti_aliasing=False,
-            ).astype(np.uint16)
-        masks_tensor.append(mask)
+    return files, matched_pattern
 
-    return files, matched_pattern, masks_tensor
+
+def _read_mask_frame(path: Path, resiz_factor: float):
+    mask = tifffile.imread(str(path)).astype(np.uint16)
+    if resiz_factor != 1.0:
+        mask = resize(
+            mask,
+            (int(round(mask.shape[0] * resiz_factor)), int(round(mask.shape[1] * resiz_factor))),
+            order=0,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(np.uint16)
+    return mask
 
 
 def run_tracking(
@@ -405,8 +405,8 @@ def run_tracking(
     result_dir = output_dir / f"{pos}_RES"
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    files, matched_pattern, masks_tensor = _load_mask_stack(mask_dir, mask_pattern, resiz_factor)
-    im_no = len(masks_tensor)
+    files, matched_pattern = _resolve_mask_files(mask_dir, mask_pattern)
+    im_no = len(files)
     if im_no == 0:
         raise RuntimeError("No mask files loaded.")
     resolved_output_digits = _resolve_output_digits(output_digits, files, im_no)
@@ -430,343 +430,369 @@ def run_tracking(
         f"output_digits={resolved_output_digits}"
     )
 
-    is1 = np.copy(masks_tensor[0]).astype(np.uint16)
-    masks = np.zeros((is1.shape[0], is1.shape[1], im_no), dtype=np.uint16)
-    masks[:, :, 0] = is1.copy()
-    iblank_g = np.zeros(is1.shape, dtype=np.uint16)
-    max_id_ever = int(np.max(is1)) if np.max(is1) > 0 else 0
-
-    tic = time.time()
-
-    for it0 in range(im_no):
-        if it0 % 25 == 0 or it0 == im_no - 1:
-            print(f"[TRACKING] frame {it0 + 1}/{im_no}")
-
-        is2 = np.copy(masks_tensor[it0]).astype(np.uint16)
-        is2c = np.copy(is2)
-        is1b = binar(is1)
-        is3 = is1b.astype(np.uint16) * is2
-
-        tr_cells = np.unique(is1[is1 != 0])
-        gap_cells = np.unique(iblank_g[iblank_g != 0])
-        cells_tr = np.concatenate((tr_cells, gap_cells))
-        iblank0 = np.zeros_like(is1)
-
-        if cells_tr.size != 0:
-            for it1 in np.sort(cells_tr):
-                is5 = (is1 == it1).copy()
-                is_gap_cell = False
-                if not np.any(is5):
-                    is5 = (iblank_g == it1).copy()
-                    is_gap_cell = True
-
-                if is_gap_cell:
-                    is6a = np.uint16(is5) * is2
-                    if strict_matlab_id_matching:
-                        iblank_g[iblank_g == it1] = 0
-                else:
-                    is6a = np.uint16(is5) * is3
-
-                if np.any(is6a):
-                    if strict_matlab_id_matching:
-                        nz = is6a[is6a != 0]
-                        if nz.size == 0:
-                            continue
-                        mode_res = mode(nz, keepdims=False)
-                        try:
-                            is2ind = int(mode_res.mode)
-                        except Exception:
-                            is2ind = int(np.ravel(mode_res.mode)[0])
-
-                        iblank0[is2 == is2ind] = it1
-                        is3[is3 == is2ind] = 0
-                        is2c[is2 == is2ind] = 0
-                        continue
-
-                    valid_match = True
-                    if is_gap_cell:
-                        overlap_area = np.sum(is6a > 0)
-                        cell_area = np.sum(is5)
-                        ratio = overlap_area / cell_area if cell_area > 0 else 0
-                        if ratio < 0.25:
-                            valid_match = False
-
-                    if valid_match:
-                        uniq = np.unique(is6a[is6a != 0])
-                        pix_si = np.zeros((len(uniq), 3))
-                        for iu in range(len(uniq)):
-                            pix_si[iu, 0] = uniq[iu]
-                            pix_si[iu, 1] = np.sum(is6a == uniq[iu])
-                        pix_si[:, 2] = pix_si[:, 1] / np.sum(pix_si[:, 1])
-
-                        pixi = pix_si[pix_si[:, 2] >= 0.35, 0].astype(int)
-                        if pixi.size == 0:
-                            pixi = pix_si[pix_si[:, 2] >= 0.10, 0].astype(int)
-
-                        pix2 = np.array([], dtype=int)
-                        for iu2 in pixi:
-                            ixx = imopen_binary(is2c == iu2, np.ones((3, 3)))
-                            pix2 = np.append(pix2, np.where(ixx.flatten())[0])
-
-                        iblank0.flat[pix2] = it1
-
-                        if is_gap_cell:
-                            iblank_g[iblank_g == it1] = 0
-
-                        i2 = iblank0 == it1
-                        ratio_a = np.sum(is5) / np.sum(i2) if np.sum(i2) > 0 else 0
-                    else:
-                        continue
-
-                    if ratio_a <= 0.80 and np.sum(erosion(is5, np.ones((9, 9)))) > 0:
-                        b = erosion(is5, np.ones((9, 9)))
-                        ba = skeletonize(b)
-                        b_endpoints = find_endpoints(ba)
-                        b1 = binary_dilation(b_endpoints, np.ones((27, 27)))
-                        b2 = b1 * ba
-                        b3 = label(b2)
-
-                        iab = np.zeros_like(is5, dtype=float)
-                        for it2 in range(1, int(b3.max()) + 1):
-                            b4 = b3 == it2
-                            props = regionprops(b4.astype(int))
-                            if len(props) > 0:
-                                orient = props[0].orientation
-                                se = np.zeros((81, 81))
-                                se[40, :] = 1
-                                se = rotate(se, np.degrees(orient), reshape=False, order=0)
-                                ab = binary_dilation(b4, se > 0.5)
-                                iab = iab + ab.astype(float)
-
-                        ia = i2.astype(int) - is5.astype(int)
-                        ib = imopen_binary(ia == 1, np.ones((3, 3)))
-                        ic = label(ib)
-                        iab2 = iab * ic
-                        pix1 = np.unique(iab2[iab2 != 0]).astype(int)
-
-                        if pix1.size > 0:
-                            for it3 in pix1:
-                                if np.sum(ic == it3) <= 1000:
-                                    ic[ic == it3] = 0
-
-                            iblank0[ic != 0] = 0
-                            id_mask = (ia == 1) * (ic == 0)
-                            id_labeled = label(id_mask)
-                            id2 = np.zeros_like(id_mask, dtype=bool)
-                            for lbl in np.unique(id_labeled[id_labeled != 0]):
-                                size = np.sum(id_labeled == lbl)
-                                if 80 <= size <= 10000:
-                                    id2[id_labeled == lbl] = True
-
-                            ig = is5 + id2
-                            pix2 = np.where(ig.flatten() != 0)[0]
-                        else:
-                            er_counts = np.array([np.sum(ic == i) for i in range(1, int(ic.max()) + 1)])
-                            er_pix = np.where(er_counts >= 1000)[0] + 1
-
-                            if er_pix.size > 0:
-                                for it3 in er_pix:
-                                    iblank0[ic == it3] = 0
-                                    ic[ic == it3] = 0
-
-                                id_mask = (ia == 1) * (ic == 0)
-                                id0 = imopen_binary(id_mask, np.ones((3, 3)))
-                                id2 = id_mask * (id0 == 0)
-                                ig = is5 + id2 + ic
-
-                                ig_labeled = label(ig.astype(bool))
-                                ig_filtered = np.zeros_like(ig, dtype=bool)
-                                for lbl in np.unique(ig_labeled[ig_labeled != 0]):
-                                    size = np.sum(ig_labeled == lbl)
-                                    if 20 <= size <= 10000000:
-                                        ig_filtered[ig_labeled == lbl] = True
-                                pix2 = np.where(ig_filtered.flatten())[0]
-                            else:
-                                iblank0.flat[pix2] = it1
-                                is3.flat[pix2] = 0
-                                is2c.flat[pix2] = 0
-
-                        iblank0.flat[pix2] = it1
-                        is3.flat[pix2] = 0
-                        is2c.flat[pix2] = 0
-
-                    elif ratio_a >= 1.1:
-                        is6a2 = is6a.astype(bool)
-                        pix3 = np.sum((is6a2 + is5) == 2)
-                        pix4 = np.sum(is5 != 0)
-
-                        if pix4 > 0 and (pix3 / pix4) > 0.9:
-                            is6b = skeletonize(erosion(is5, np.ones((3, 3)))).astype(np.uint16) * is3
-                            if not np.any(is6b):
-                                is6b = erosion(is5, np.ones((3, 3))).astype(np.uint16) * is3
-
-                            pix5 = np.unique(is6b[is6b != 0])
-                            pix51 = np.sum(is5 != 0)
-                            pix6 = np.array([0])
-
-                            for iu3 in pix5:
-                                pix0 = np.where(imopen_binary(is2c == iu3, np.ones((3, 3))).flatten())[0]
-                                pix52 = np.where((is6a == iu3).flatten())[0]
-                                pix52b = len(pix52)
-
-                                if pix51 > 0 and pix52b > 0:
-                                    if (len(pix0) / pix51 < 0.9) and (len(pix0) / pix52b < 1.5):
-                                        pix6 = np.append(pix6, pix0)
-                                    elif len(pix0) / pix52b > 1.5:
-                                        pix6 = np.append(pix6, pix52)
-
-                            if np.any(pix6 != 0):
-                                pix6 = pix6[pix6 != 0]
-                                ib = np.zeros_like(is5)
-                                ib.flat[pix6.astype(int)] = 1
-                                ib1 = skeletonize(ib.astype(bool))
-                                ib_branchpoints = find_branchpoints(ib1)
-                                ib2 = binary_dilation(ib_branchpoints, np.ones((3, 3)))
-                                ib3 = np.unique((is6a * ib2.astype(np.uint16))[is6a * ib2.astype(np.uint16) != 0])
-
-                                ic1 = skeletonize(is5.astype(bool))
-                                ic_branchpoints = find_branchpoints(ic1)
-                                ic2 = binary_dilation(ic_branchpoints, np.ones((3, 3)))
-                                ic3 = np.unique((is6a * ic2.astype(np.uint16))[is6a * ic2.astype(np.uint16) != 0])
-
-                                pixi = np.setdiff1d(ib3, ic3)
-                                if pixi.size > 0:
-                                    for ij in pixi:
-                                        erasepix = np.where((is6a == ij).flatten())[0]
-                                        ib.flat[erasepix] = 0
-
-                                ib = imopen_binary(ib, np.ones((3, 3)))
-                                pix7 = np.where(ib.flatten() != 0)[0]
-                            else:
-                                pix7 = np.where(is5.flatten() != 0)[0]
-                                ibb = np.zeros_like(is5)
-                                ibb.flat[pix7] = 1
-                                ix2 = ibb * iblank0
-                                ix2 = imopen_binary(ix2, np.ones((3, 3)))
-                                pixt = np.where((ix2 != it1).flatten())[0]
-                                ibb.flat[pixt] = 0
-                                pix7 = np.where(ibb.flatten() != 0)[0]
-
-                            iblank0.flat[pix7] = it1
-                            is3.flat[pix7] = 0
-                            is2c.flat[pix7] = 0
-                    else:
-                        is3.flat[pix2] = 0
-                        is2c.flat[pix2] = 0
-
-            seg_gap = np.setdiff1d(tr_cells, np.unique(iblank0))
-            if seg_gap.size > 0:
-                for itg in seg_gap:
-                    iblank_g[is1 == itg] = itg
-
-            iblank0b = iblank0.copy()
-            iblank0b[iblank0 != 0] = 1
-            isb = is2 * np.uint16(~iblank0b.astype(bool))
-            isb = imopen_labels(isb, np.ones((3, 3)))
-            newcells = np.unique(isb[isb != 0])
-            iblank = iblank0.copy()
-
-            if newcells.size > 0:
-                for a, it2 in enumerate(newcells, start=1):
-                    assigned_id = max_id_ever + a
-                    iblank[isb == it2] = assigned_id
-                max_id_ever += len(newcells)
-
-            masks[:, :, it0] = np.uint16(iblank).copy()
-            is1 = masks[:, :, it0].copy()
-        else:
-            masks[:, :, it0] = is2.copy()
-            is1 = is2.copy()
-            if it0 == 0 or max_id_ever == 0:
-                max_id_ever = int(np.max(is2)) if np.max(is2) > 0 else 0
-
-    elapsed_time = time.time() - tic
-    print(f"[TRACKING] main_loop_elapsed={elapsed_time:.2f}s")
-
     if down_factor <= 0:
         raise ValueError("down_factor must be >= 1")
 
-    im_no_original = int(masks.shape[2])
-    downsiz = np.arange(0, im_no_original, down_factor, dtype=int)
-    dz = int(len(downsiz))
-    if dz == 0:
-        downsiz = np.array([0], dtype=int)
-        dz = 1
+    first_mask = _read_mask_frame(files[0], resiz_factor)
+    frame_shape = first_mask.shape
 
-    print("[TRACKING] post: preparing downsampled mask stack", flush=True)
-    mask0 = masks[:, :, downsiz].astype(np.uint16).copy()
-    max_id = int(np.max(mask0)) if np.max(mask0) > 0 else 0
-    numb_m1 = int(mask0.shape[2])
-    tp_im = np.zeros((max_id, numb_m1), dtype=np.int64)
-    if max_id > 0:
-        print(f"[TRACKING] post: building temporal presence table for {numb_m1} frames", flush=True)
-        for ih in range(numb_m1):
-            if ih % 250 == 0 or ih == numb_m1 - 1:
-                print(f"[TRACKING] post frame {ih + 1}/{numb_m1}", flush=True)
-            counts = np.bincount(mask0[:, :, ih].ravel(), minlength=max_id + 1)
-            tp_im[:, ih] = counts[1:]
+    tracked_stack_path = output_dir / f"{pos}_tracked_stack.uint16.mmap"
+    if tracked_stack_path.exists():
+        tracked_stack_path.unlink()
 
-    obj = np.unique(mask0[mask0 != 0]).astype(int)
-    tp1 = (tp_im != 0).astype(np.uint8)
-
-    print(f"[TRACKING] post: resolving discontinuous tracks across {len(obj)} objects", flush=True)
-    for cel1 in obj:
-        if cel1 <= 0 or cel1 > tp1.shape[0]:
-            continue
-        tpz, num_components = bwlabel(tp1[cel1 - 1, :].astype(np.uint8))
-        if num_components > 1:
-            for it in range(2, num_components + 1):
-                timepoints_to_change = np.where(tpz == it)[0]
-                new_length = tp_im.shape[0] + 1
-                tp_im = np.vstack([tp_im, np.zeros((1, numb_m1), dtype=tp_im.dtype)])
-                tp1 = np.vstack([tp1, np.zeros((1, numb_m1), dtype=tp1.dtype)])
-
-                for it2 in timepoints_to_change:
-                    mask_2_change = mask0[:, :, it2]
-                    pixo = mask_2_change == cel1
-                    if np.any(pixo):
-                        mask_2_change = mask_2_change.copy()
-                        mask_2_change[pixo] = new_length
-                        mask0[:, :, it2] = mask_2_change
-
-                    tp_im[new_length - 1, it2] = tp_im[cel1 - 1, it2]
-                    tp_im[cel1 - 1, it2] = 0
-                    tp1[new_length - 1, it2] = 1
-                    tp1[cel1 - 1, it2] = 0
-
-    tp2 = (tp_im != 0).astype(np.uint8)
-    obj_cor = (np.where(np.sum(tp2, axis=1) >= time_series_threshold)[0] + 1).astype(int)
-    no_obj = int(len(obj_cor))
-
-    print(f"[TRACKING] post: compacting surviving tracks to {no_obj} objects", flush=True)
-    mask1 = np.zeros_like(mask0, dtype=np.uint16)
-    all_ob = np.zeros((no_obj, numb_m1), dtype=np.int64)
-    for seq_id, raw_id in enumerate(obj_cor, start=1):
-        mask1[mask0 == raw_id] = seq_id
-        all_ob[seq_id - 1, :] = tp_im[raw_id - 1, :]
-
-    cell_exists = np.zeros((2, no_obj), dtype=np.int64)
-    for seq_id in range(no_obj):
-        nz = np.where(all_ob[seq_id, :] != 0)[0]
-        if nz.size > 0:
-            cell_exists[0, seq_id] = int(nz[0])
-            cell_exists[1, seq_id] = int(nz[-1])
-
-    final_number_frames = int(mask1.shape[2])
-    final_tracked_tensor = mask1
-    del mask0, tp_im, tp1, tp2, all_ob, cell_exists
-
-    track_count, final_number_objects = _write_challenge_outputs(
-        result_dir=result_dir,
-        final_tracked_tensor=final_tracked_tensor,
-        output_digits=resolved_output_digits,
-    )
-
+    bytes_per_frame = frame_shape[0] * frame_shape[1] * np.dtype(np.uint16).itemsize
+    estimated_stack_gib = (bytes_per_frame * im_no) / (1024**3)
     print(
-        f"[TRACKING] END final_objects={final_number_objects} "
-        f"frames={final_number_frames} down_factor={down_factor} dz={dz} "
-        f"res_track_rows={track_count} result_dir={result_dir}"
+        f"[TRACKING] low-memory mode: disk-backed stack={tracked_stack_path} "
+        f"shape={frame_shape} frames={im_no} estimated_size={estimated_stack_gib:.2f} GiB"
     )
+
+    tracked_stack = None
+    try:
+        tracked_stack = np.memmap(
+            tracked_stack_path,
+            mode="w+",
+            dtype=np.uint16,
+            shape=(frame_shape[0], frame_shape[1], im_no),
+        )
+
+        is1 = np.copy(first_mask).astype(np.uint16)
+        iblank_g = np.zeros(is1.shape, dtype=np.uint16)
+        max_id_ever = int(np.max(is1)) if np.max(is1) > 0 else 0
+
+        tic = time.time()
+
+        for it0 in range(im_no):
+            if it0 % 25 == 0 or it0 == im_no - 1:
+                print(f"[TRACKING] frame {it0 + 1}/{im_no}")
+
+            if it0 == 0:
+                is2 = np.copy(first_mask).astype(np.uint16)
+            else:
+                is2 = np.copy(_read_mask_frame(files[it0], resiz_factor)).astype(np.uint16)
+                if is2.shape != frame_shape:
+                    raise ValueError(
+                        f"Mask shape mismatch for {files[it0].name}: got {is2.shape}, expected {frame_shape}."
+                    )
+            is2c = np.copy(is2)
+            is1b = binar(is1)
+            is3 = is1b.astype(np.uint16) * is2
+
+            tr_cells = np.unique(is1[is1 != 0])
+            gap_cells = np.unique(iblank_g[iblank_g != 0])
+            cells_tr = np.concatenate((tr_cells, gap_cells))
+            iblank0 = np.zeros_like(is1)
+
+            if cells_tr.size != 0:
+                for it1 in np.sort(cells_tr):
+                    is5 = (is1 == it1).copy()
+                    is_gap_cell = False
+                    if not np.any(is5):
+                        is5 = (iblank_g == it1).copy()
+                        is_gap_cell = True
+
+                    if is_gap_cell:
+                        is6a = np.uint16(is5) * is2
+                        if strict_matlab_id_matching:
+                            iblank_g[iblank_g == it1] = 0
+                    else:
+                        is6a = np.uint16(is5) * is3
+
+                    if np.any(is6a):
+                        if strict_matlab_id_matching:
+                            nz = is6a[is6a != 0]
+                            if nz.size == 0:
+                                continue
+                            mode_res = mode(nz, keepdims=False)
+                            try:
+                                is2ind = int(mode_res.mode)
+                            except Exception:
+                                is2ind = int(np.ravel(mode_res.mode)[0])
+
+                            iblank0[is2 == is2ind] = it1
+                            is3[is3 == is2ind] = 0
+                            is2c[is2 == is2ind] = 0
+                            continue
+
+                        valid_match = True
+                        if is_gap_cell:
+                            overlap_area = np.sum(is6a > 0)
+                            cell_area = np.sum(is5)
+                            ratio = overlap_area / cell_area if cell_area > 0 else 0
+                            if ratio < 0.25:
+                                valid_match = False
+
+                        if valid_match:
+                            uniq = np.unique(is6a[is6a != 0])
+                            pix_si = np.zeros((len(uniq), 3))
+                            for iu in range(len(uniq)):
+                                pix_si[iu, 0] = uniq[iu]
+                                pix_si[iu, 1] = np.sum(is6a == uniq[iu])
+                            pix_si[:, 2] = pix_si[:, 1] / np.sum(pix_si[:, 1])
+
+                            pixi = pix_si[pix_si[:, 2] >= 0.35, 0].astype(int)
+                            if pixi.size == 0:
+                                pixi = pix_si[pix_si[:, 2] >= 0.10, 0].astype(int)
+
+                            pix2 = np.array([], dtype=int)
+                            for iu2 in pixi:
+                                ixx = imopen_binary(is2c == iu2, np.ones((3, 3)))
+                                pix2 = np.append(pix2, np.where(ixx.flatten())[0])
+
+                            iblank0.flat[pix2] = it1
+
+                            if is_gap_cell:
+                                iblank_g[iblank_g == it1] = 0
+
+                            i2 = iblank0 == it1
+                            ratio_a = np.sum(is5) / np.sum(i2) if np.sum(i2) > 0 else 0
+                        else:
+                            continue
+
+                        if ratio_a <= 0.80 and np.sum(erosion(is5, np.ones((9, 9)))) > 0:
+                            b = erosion(is5, np.ones((9, 9)))
+                            ba = skeletonize(b)
+                            b_endpoints = find_endpoints(ba)
+                            b1 = binary_dilation(b_endpoints, np.ones((27, 27)))
+                            b2 = b1 * ba
+                            b3 = label(b2)
+
+                            iab = np.zeros_like(is5, dtype=float)
+                            for it2 in range(1, int(b3.max()) + 1):
+                                b4 = b3 == it2
+                                props = regionprops(b4.astype(int))
+                                if len(props) > 0:
+                                    orient = props[0].orientation
+                                    se = np.zeros((81, 81))
+                                    se[40, :] = 1
+                                    se = rotate(se, np.degrees(orient), reshape=False, order=0)
+                                    ab = binary_dilation(b4, se > 0.5)
+                                    iab = iab + ab.astype(float)
+
+                            ia = i2.astype(int) - is5.astype(int)
+                            ib = imopen_binary(ia == 1, np.ones((3, 3)))
+                            ic = label(ib)
+                            iab2 = iab * ic
+                            pix1 = np.unique(iab2[iab2 != 0]).astype(int)
+
+                            if pix1.size > 0:
+                                for it3 in pix1:
+                                    if np.sum(ic == it3) <= 1000:
+                                        ic[ic == it3] = 0
+
+                                iblank0[ic != 0] = 0
+                                id_mask = (ia == 1) * (ic == 0)
+                                id_labeled = label(id_mask)
+                                id2 = np.zeros_like(id_mask, dtype=bool)
+                                for lbl in np.unique(id_labeled[id_labeled != 0]):
+                                    size = np.sum(id_labeled == lbl)
+                                    if 80 <= size <= 10000:
+                                        id2[id_labeled == lbl] = True
+
+                                ig = is5 + id2
+                                pix2 = np.where(ig.flatten() != 0)[0]
+                            else:
+                                er_counts = np.array([np.sum(ic == i) for i in range(1, int(ic.max()) + 1)])
+                                er_pix = np.where(er_counts >= 1000)[0] + 1
+
+                                if er_pix.size > 0:
+                                    for it3 in er_pix:
+                                        iblank0[ic == it3] = 0
+                                        ic[ic == it3] = 0
+
+                                    id_mask = (ia == 1) * (ic == 0)
+                                    id0 = imopen_binary(id_mask, np.ones((3, 3)))
+                                    id2 = id_mask * (id0 == 0)
+                                    ig = is5 + id2 + ic
+
+                                    ig_labeled = label(ig.astype(bool))
+                                    ig_filtered = np.zeros_like(ig, dtype=bool)
+                                    for lbl in np.unique(ig_labeled[ig_labeled != 0]):
+                                        size = np.sum(ig_labeled == lbl)
+                                        if 20 <= size <= 10000000:
+                                            ig_filtered[ig_labeled == lbl] = True
+                                    pix2 = np.where(ig_filtered.flatten())[0]
+                                else:
+                                    iblank0.flat[pix2] = it1
+                                    is3.flat[pix2] = 0
+                                    is2c.flat[pix2] = 0
+
+                            iblank0.flat[pix2] = it1
+                            is3.flat[pix2] = 0
+                            is2c.flat[pix2] = 0
+
+                        elif ratio_a >= 1.1:
+                            is6a2 = is6a.astype(bool)
+                            pix3 = np.sum((is6a2 + is5) == 2)
+                            pix4 = np.sum(is5 != 0)
+
+                            if pix4 > 0 and (pix3 / pix4) > 0.9:
+                                is6b = skeletonize(erosion(is5, np.ones((3, 3)))).astype(np.uint16) * is3
+                                if not np.any(is6b):
+                                    is6b = erosion(is5, np.ones((3, 3))).astype(np.uint16) * is3
+
+                                pix5 = np.unique(is6b[is6b != 0])
+                                pix51 = np.sum(is5 != 0)
+                                pix6 = np.array([0])
+
+                                for iu3 in pix5:
+                                    pix0 = np.where(imopen_binary(is2c == iu3, np.ones((3, 3))).flatten())[0]
+                                    pix52 = np.where((is6a == iu3).flatten())[0]
+                                    pix52b = len(pix52)
+
+                                    if pix51 > 0 and pix52b > 0:
+                                        if (len(pix0) / pix51 < 0.9) and (len(pix0) / pix52b < 1.5):
+                                            pix6 = np.append(pix6, pix0)
+                                        elif len(pix0) / pix52b > 1.5:
+                                            pix6 = np.append(pix6, pix52)
+
+                                if np.any(pix6 != 0):
+                                    pix6 = pix6[pix6 != 0]
+                                    ib = np.zeros_like(is5)
+                                    ib.flat[pix6.astype(int)] = 1
+                                    ib1 = skeletonize(ib.astype(bool))
+                                    ib_branchpoints = find_branchpoints(ib1)
+                                    ib2 = binary_dilation(ib_branchpoints, np.ones((3, 3)))
+                                    ib3 = np.unique((is6a * ib2.astype(np.uint16))[is6a * ib2.astype(np.uint16) != 0])
+
+                                    ic1 = skeletonize(is5.astype(bool))
+                                    ic_branchpoints = find_branchpoints(ic1)
+                                    ic2 = binary_dilation(ic_branchpoints, np.ones((3, 3)))
+                                    ic3 = np.unique((is6a * ic2.astype(np.uint16))[is6a * ic2.astype(np.uint16) != 0])
+
+                                    pixi = np.setdiff1d(ib3, ic3)
+                                    if pixi.size > 0:
+                                        for ij in pixi:
+                                            erasepix = np.where((is6a == ij).flatten())[0]
+                                            ib.flat[erasepix] = 0
+
+                                    ib = imopen_binary(ib, np.ones((3, 3)))
+                                    pix7 = np.where(ib.flatten() != 0)[0]
+                                else:
+                                    pix7 = np.where(is5.flatten() != 0)[0]
+                                    ibb = np.zeros_like(is5)
+                                    ibb.flat[pix7] = 1
+                                    ix2 = ibb * iblank0
+                                    ix2 = imopen_binary(ix2, np.ones((3, 3)))
+                                    pixt = np.where((ix2 != it1).flatten())[0]
+                                    ibb.flat[pixt] = 0
+                                    pix7 = np.where(ibb.flatten() != 0)[0]
+
+                                iblank0.flat[pix7] = it1
+                                is3.flat[pix7] = 0
+                                is2c.flat[pix7] = 0
+                        else:
+                            is3.flat[pix2] = 0
+                            is2c.flat[pix2] = 0
+
+                seg_gap = np.setdiff1d(tr_cells, np.unique(iblank0))
+                if seg_gap.size > 0:
+                    for itg in seg_gap:
+                        iblank_g[is1 == itg] = itg
+
+                iblank0b = iblank0.copy()
+                iblank0b[iblank0 != 0] = 1
+                isb = is2 * np.uint16(~iblank0b.astype(bool))
+                isb = imopen_labels(isb, np.ones((3, 3)))
+                newcells = np.unique(isb[isb != 0])
+                iblank = iblank0.copy()
+
+                if newcells.size > 0:
+                    for a, it2 in enumerate(newcells, start=1):
+                        assigned_id = max_id_ever + a
+                        iblank[isb == it2] = assigned_id
+                    max_id_ever += len(newcells)
+
+                tracked_stack[:, :, it0] = np.uint16(iblank).copy()
+                is1 = tracked_stack[:, :, it0].copy()
+            else:
+                tracked_stack[:, :, it0] = is2.copy()
+                is1 = is2.copy()
+                if it0 == 0 or max_id_ever == 0:
+                    max_id_ever = int(np.max(is2)) if np.max(is2) > 0 else 0
+
+        elapsed_time = time.time() - tic
+        print(f"[TRACKING] main_loop_elapsed={elapsed_time:.2f}s")
+        tracked_stack.flush()
+
+        print("[TRACKING] post: preparing downsampled mask stack", flush=True)
+        mask0 = tracked_stack
+        dz = int(mask0.shape[2])
+        max_id = int(np.max(mask0)) if np.max(mask0) > 0 else 0
+        numb_m1 = int(mask0.shape[2])
+        tp_im = np.zeros((max_id, numb_m1), dtype=np.uint32)
+        if max_id > 0:
+            print(f"[TRACKING] post: building temporal presence table for {numb_m1} frames", flush=True)
+            for ih in range(numb_m1):
+                if ih % 250 == 0 or ih == numb_m1 - 1:
+                    print(f"[TRACKING] post frame {ih + 1}/{numb_m1}", flush=True)
+                counts = np.bincount(mask0[:, :, ih].ravel(), minlength=max_id + 1)
+                tp_im[:, ih] = counts[1:].astype(np.uint32, copy=False)
+
+        obj = np.where(np.any(tp_im != 0, axis=1))[0] + 1
+        tp1 = tp_im != 0
+
+        print(f"[TRACKING] post: resolving discontinuous tracks across {len(obj)} objects", flush=True)
+        for cel1 in obj:
+            if cel1 <= 0 or cel1 > tp1.shape[0]:
+                continue
+            tpz, num_components = bwlabel(tp1[cel1 - 1, :].astype(np.uint8))
+            if num_components > 1:
+                for it in range(2, num_components + 1):
+                    timepoints_to_change = np.where(tpz == it)[0]
+                    new_length = tp_im.shape[0] + 1
+                    if new_length > np.iinfo(np.uint16).max:
+                        raise ValueError("Track count exceeds uint16 capacity required for challenge mask export.")
+                    tp_im = np.vstack([tp_im, np.zeros((1, numb_m1), dtype=tp_im.dtype)])
+                    tp1 = np.vstack([tp1, np.zeros((1, numb_m1), dtype=tp1.dtype)])
+
+                    for it2 in timepoints_to_change:
+                        mask_2_change = mask0[:, :, it2]
+                        pixo = mask_2_change == cel1
+                        if np.any(pixo):
+                            mask_2_change[pixo] = new_length
+
+                        tp_im[new_length - 1, it2] = tp_im[cel1 - 1, it2]
+                        tp_im[cel1 - 1, it2] = 0
+                        tp1[new_length - 1, it2] = True
+                        tp1[cel1 - 1, it2] = False
+
+        obj_cor = (np.where(np.sum(tp1, axis=1) >= time_series_threshold)[0] + 1).astype(int)
+        no_obj = int(len(obj_cor))
+        if no_obj > np.iinfo(np.uint16).max:
+            raise ValueError("Track count exceeds uint16 capacity required for challenge mask export.")
+
+        print(f"[TRACKING] post: compacting surviving tracks to {no_obj} objects", flush=True)
+        track_id_map = np.zeros(tp_im.shape[0] + 1, dtype=np.uint16)
+        for seq_id, raw_id in enumerate(obj_cor, start=1):
+            track_id_map[raw_id] = seq_id
+
+        for frame_idx in range(numb_m1):
+            if frame_idx % 250 == 0 or frame_idx == numb_m1 - 1:
+                print(f"[TRACKING] post remap frame {frame_idx + 1}/{numb_m1}", flush=True)
+            mask0[:, :, frame_idx] = track_id_map[mask0[:, :, frame_idx]]
+
+        final_number_frames = int(mask0.shape[2])
+        final_tracked_tensor = mask0
+        del tp_im, tp1, track_id_map
+
+        track_count, final_number_objects = _write_challenge_outputs(
+            result_dir=result_dir,
+            final_tracked_tensor=final_tracked_tensor,
+            output_digits=resolved_output_digits,
+        )
+
+        print(
+            f"[TRACKING] END final_objects={final_number_objects} "
+            f"frames={final_number_frames} down_factor={down_factor} dz={dz} "
+            f"res_track_rows={track_count} result_dir={result_dir}"
+        )
+    finally:
+        if tracked_stack is not None:
+            tracked_stack.flush()
+            del tracked_stack
+        if tracked_stack_path.exists():
+            tracked_stack_path.unlink()
 
 
 def parse_args():
