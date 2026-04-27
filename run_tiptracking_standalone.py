@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import gc
 import re
 import time
 from pathlib import Path
@@ -436,9 +437,7 @@ def run_tracking(
     first_mask = _read_mask_frame(files[0], resiz_factor)
     frame_shape = first_mask.shape
 
-    tracked_stack_path = output_dir / f"{pos}_tracked_stack.uint16.mmap"
-    if tracked_stack_path.exists():
-        tracked_stack_path.unlink()
+    tracked_stack_path = output_dir / f"{pos}_tracked_stack_{time.time_ns()}.uint16.mmap"
 
     bytes_per_frame = frame_shape[0] * frame_shape[1] * np.dtype(np.uint16).itemsize
     estimated_stack_gib = (bytes_per_frame * im_no) / (1024**3)
@@ -448,6 +447,9 @@ def run_tracking(
     )
 
     tracked_stack = None
+    mask0 = None
+    final_tracked_tensor = None
+    mask_2_change = None
     try:
         tracked_stack = np.memmap(
             tracked_stack_path,
@@ -733,6 +735,7 @@ def run_tracking(
         tp1 = tp_im != 0
 
         print(f"[TRACKING] post: resolving discontinuous tracks across {len(obj)} objects", flush=True)
+        pruned_short_fragments = 0
         for cel1 in obj:
             if cel1 <= 0 or cel1 > tp1.shape[0]:
                 continue
@@ -740,9 +743,24 @@ def run_tracking(
             if num_components > 1:
                 for it in range(2, num_components + 1):
                     timepoints_to_change = np.where(tpz == it)[0]
+                    if timepoints_to_change.size < time_series_threshold:
+                        # Drop tiny disconnected fragments early so they do not consume extra track IDs.
+                        for it2 in timepoints_to_change:
+                            mask_2_change = mask0[:, :, it2]
+                            pixo = mask_2_change == cel1
+                            if np.any(pixo):
+                                mask_2_change[pixo] = 0
+                            tp_im[cel1 - 1, it2] = 0
+                            tp1[cel1 - 1, it2] = False
+                        pruned_short_fragments += 1
+                        continue
                     new_length = tp_im.shape[0] + 1
                     if new_length > np.iinfo(np.uint16).max:
-                        raise ValueError("Track count exceeds uint16 capacity required for challenge mask export.")
+                        raise ValueError(
+                            "Track count exceeded uint16 capacity during discontinuity splitting. "
+                            "Try increasing --time-series-threshold to discard short fragments, "
+                            "or improve segmentation continuity."
+                        )
                     tp_im = np.vstack([tp_im, np.zeros((1, numb_m1), dtype=tp_im.dtype)])
                     tp1 = np.vstack([tp1, np.zeros((1, numb_m1), dtype=tp1.dtype)])
 
@@ -756,6 +774,12 @@ def run_tracking(
                         tp_im[cel1 - 1, it2] = 0
                         tp1[new_length - 1, it2] = True
                         tp1[cel1 - 1, it2] = False
+        if pruned_short_fragments > 0:
+            print(
+                f"[TRACKING] post: pruned {pruned_short_fragments} disconnected fragments "
+                f"shorter than time-series-threshold={time_series_threshold}",
+                flush=True,
+            )
 
         obj_cor = (np.where(np.sum(tp1, axis=1) >= time_series_threshold)[0] + 1).astype(int)
         no_obj = int(len(obj_cor))
@@ -790,9 +814,28 @@ def run_tracking(
     finally:
         if tracked_stack is not None:
             tracked_stack.flush()
-            del tracked_stack
+
+        # Ensure all memmap references are dropped before attempting to remove the backing file.
+        mask_2_change = None
+        final_tracked_tensor = None
+        mask0 = None
+        tracked_stack = None
+        gc.collect()
+
         if tracked_stack_path.exists():
-            tracked_stack_path.unlink()
+            removed = False
+            for retry_idx in range(5):
+                try:
+                    tracked_stack_path.unlink()
+                    removed = True
+                    break
+                except PermissionError:
+                    time.sleep(0.2 * (retry_idx + 1))
+            if not removed and tracked_stack_path.exists():
+                print(
+                    f"[TRACKING] warning: could not remove temporary memmap file: {tracked_stack_path}",
+                    flush=True,
+                )
 
 
 def parse_args():
