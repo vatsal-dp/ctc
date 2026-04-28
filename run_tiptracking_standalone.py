@@ -150,6 +150,39 @@ def _infer_parent_id(
     return best_parent_id
 
 
+def _has_self_continuity(
+    prev_frame: np.ndarray,
+    curr_frame: np.ndarray,
+    track_id: int,
+    min_touch_pixels: int = 10,
+    min_touch_ratio: float = 0.05,
+) -> bool:
+    previous_mask = prev_frame == track_id
+    current_mask = curr_frame == track_id
+    current_pixels = int(np.count_nonzero(current_mask))
+    if current_pixels == 0 or not np.any(previous_mask):
+        return False
+
+    dilated_previous = binary_dilation(previous_mask.astype(bool), np.ones((3, 3), dtype=bool))
+    touch_pixels = int(np.count_nonzero(current_mask & dilated_previous))
+    if touch_pixels < min_touch_pixels:
+        return False
+    return (touch_pixels / current_pixels) >= min_touch_ratio
+
+
+def _fork_existing_daughter_label(
+    normalized_tensor: np.ndarray,
+    child_id: int,
+    frame_idx: int,
+    new_child_id: int,
+) -> None:
+    for time_idx in range(frame_idx, int(normalized_tensor.shape[2])):
+        frame_t = normalized_tensor[:, :, time_idx]
+        child_pixels = frame_t == child_id
+        if np.any(child_pixels):
+            frame_t[child_pixels] = new_child_id
+
+
 def _track_ids_in_frame(frame: np.ndarray):
     ids = np.unique(frame)
     return ids[ids != 0].astype(int)
@@ -233,15 +266,13 @@ def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray, division_cooldown
 
         curr_ids = _track_ids_in_frame(curr_frame).tolist()
         newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
-        if not newborn_ids:
-            continue
 
         protected_track_ids = (
             _active_cooldown_track_ids(cooldown_until, frame_idx)
             if division_cooldown_frames > 0
             else set()
         )
-        if protected_track_ids:
+        if protected_track_ids and newborn_ids:
             newborn_ids = _rescue_cooldown_label_swaps(
                 normalized_tensor=normalized_tensor,
                 frame_idx=frame_idx,
@@ -253,30 +284,31 @@ def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray, division_cooldown
             prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
             curr_ids = _track_ids_in_frame(curr_frame).tolist()
             newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
-            if not newborn_ids:
-                continue
 
-        mother_to_newborns = {}
+        mother_to_children = {}
+        newborn_id_set = set(newborn_ids)
         valid_parent_ids = prev_ids - protected_track_ids
-        for newborn_id in newborn_ids:
-            child_mask = curr_frame == newborn_id
+        for child_id in curr_ids:
+            if child_id in prev_ids and _has_self_continuity(prev_frame, curr_frame, child_id):
+                continue
+            child_mask = curr_frame == child_id
             mother_id = _infer_parent_id(
                 prev_frame=prev_frame,
                 child_mask=child_mask,
-                child_track_id=newborn_id,
+                child_track_id=child_id,
                 valid_track_ids=valid_parent_ids,
             )
             if mother_id == 0:
                 continue
-            mother_to_newborns.setdefault(mother_id, []).append(newborn_id)
+            mother_to_children.setdefault(mother_id, []).append(child_id)
 
-        if not mother_to_newborns:
+        if not mother_to_children:
             continue
 
         curr_id_set = set(curr_ids)
-        for mother_id in sorted(mother_to_newborns):
-            newborns = sorted(set(mother_to_newborns[mother_id]))
-            daughter_ids = list(newborns)
+        for mother_id in sorted(mother_to_children):
+            child_ids = sorted(set(mother_to_children[mother_id]))
+            daughter_ids = []
 
             if mother_id in curr_id_set:
                 max_track_id += 1
@@ -295,11 +327,22 @@ def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray, division_cooldown
                 daughter_ids.append(continuation_daughter_id)
                 curr_id_set.discard(mother_id)
                 curr_id_set.add(continuation_daughter_id)
-            elif len(newborns) < 2:
+            elif len(child_ids) < 2:
                 continue
 
-            for newborn_id in newborns:
-                parent_map[newborn_id] = mother_id
+            for child_id in child_ids:
+                if child_id in newborn_id_set:
+                    daughter_id = child_id
+                else:
+                    max_track_id += 1
+                    if max_track_id > max_uint16:
+                        raise ValueError("Division normalization would exceed uint16 track ID capacity.")
+                    daughter_id = max_track_id
+                    _fork_existing_daughter_label(normalized_tensor, child_id, frame_idx, daughter_id)
+                    curr_id_set.discard(child_id)
+                    curr_id_set.add(daughter_id)
+                parent_map[daughter_id] = mother_id
+                daughter_ids.append(daughter_id)
 
             if division_cooldown_frames > 0:
                 cooldown_end = frame_idx + division_cooldown_frames

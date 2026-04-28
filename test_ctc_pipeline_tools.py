@@ -116,6 +116,14 @@ class CTCPipelineToolTests(unittest.TestCase):
         stack[5:8, 2:8, 1:] = 3
         return stack
 
+    def _division_stack_with_reused_daughter_label(self, frame_count=2):
+        stack = np.zeros((12, 12, frame_count), dtype=np.uint16)
+        stack[2:8, 2:8, 0] = 1
+        stack[9:11, 9:11, 0] = 2
+        stack[2:5, 2:8, 1:] = 2
+        stack[5:8, 2:8, 1:] = 3
+        return stack
+
     def test_normalize_ctc_divisions_creates_parent_rows(self):
         stack = self._division_stack(frame_count=2)
 
@@ -142,6 +150,29 @@ class CTCPipelineToolTests(unittest.TestCase):
         self.assertEqual(parent_map, {2: 1, 3: 1})
         self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), {0, 2, 3})
         self.assertFalse(np.any(normalized[:, :, 1] == 1))
+
+    def test_normalize_ctc_divisions_forks_reused_daughter_label(self):
+        stack = self._division_stack_with_reused_daughter_label(frame_count=2)
+
+        normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=20)
+
+        self.assertEqual(parent_map, {3: 1, 4: 1})
+        self.assertEqual(set(np.unique(normalized[:, :, 0]).tolist()), {0, 1, 2})
+        self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), {0, 3, 4})
+        self.assertFalse(np.any(normalized[:, :, 1] == 1))
+        self.assertFalse(np.any(normalized[:, :, 1] == 2))
+
+    def test_ram_normalize_ctc_divisions_forks_reused_daughter_label(self):
+        stack = self._division_stack_with_reused_daughter_label(frame_count=2)
+
+        normalized, parent_map = _normalize_ctc_divisions_ram(stack, division_cooldown_frames=20)
+
+        self.assertEqual(set(parent_map.values()), {1})
+        self.assertEqual(len(parent_map), 2)
+        self.assertEqual(set(np.unique(normalized[:, :, 0]).tolist()), {0, 1, 2})
+        self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), set(parent_map) | {0})
+        self.assertFalse(np.any(normalized[:, :, 1] == 1))
+        self.assertFalse(np.any(normalized[:, :, 1] == 2))
 
     def test_division_cooldown_rescues_daughter_label_swap(self):
         stack = self._division_stack(frame_count=3)
