@@ -16,7 +16,9 @@ from run_tiptracking_standalone import (
     _resolve_output_digits,
     _split_discontinuous_tracks,
 )
+from rescale_image_mask_pairs import rescale_dataset, resize_mask_array
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
+from visualize_rescale_overlay import export_rescale_overlay_comparisons
 from view_tracking_overlay import (
     _build_lineage_layout,
     _filter_lineage_track_rows,
@@ -518,6 +520,70 @@ class CTCPipelineToolTests(unittest.TestCase):
                     export_dir=export_dir,
                     track_rows=_parse_track_file(track_file),
                 )
+
+    def test_resize_mask_array_preserves_integer_labels(self):
+        mask = np.zeros((8, 8), dtype=np.uint16)
+        mask[0:4, 0:4] = 7
+        mask[4:8, 4:8] = 13
+
+        resized = resize_mask_array(mask, scale=0.5)
+
+        self.assertEqual(resized.shape, (4, 4))
+        self.assertEqual(resized.dtype, np.uint16)
+        self.assertEqual(set(np.unique(resized).tolist()), {0, 7, 13})
+
+    def test_rescale_dataset_and_overlay_quality_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_dir = root / "images"
+            mask_dir = root / "masks"
+            scaled_image_dir = root / "scaled_images"
+            scaled_mask_dir = root / "scaled_masks"
+            qa_dir = root / "qa"
+            image_dir.mkdir()
+            mask_dir.mkdir()
+
+            for frame_idx in range(2):
+                image = np.zeros((8, 8), dtype=np.uint16)
+                image[2:6, 2:6] = 100 + frame_idx
+                mask = np.zeros((8, 8), dtype=np.uint16)
+                mask[0:4, 0:4] = 1
+                mask[4:8, 4:8] = 2
+                tifffile.imwrite(image_dir / f"t{frame_idx:03d}.tif", image)
+                tifffile.imwrite(mask_dir / f"mask{frame_idx:03d}.tif", mask)
+
+            (mask_dir / "res_track.txt").write_text("1 0 1 0\n2 0 1 0\n", encoding="utf-8")
+
+            image_results, mask_results, copied_track_file = rescale_dataset(
+                image_dir=image_dir,
+                mask_dir=mask_dir,
+                output_image_dir=scaled_image_dir,
+                output_mask_dir=scaled_mask_dir,
+                scale=0.5,
+            )
+
+            self.assertEqual(len(image_results), 2)
+            self.assertEqual(len(mask_results), 2)
+            self.assertTrue(copied_track_file.is_file())
+            self.assertEqual(tifffile.imread(scaled_image_dir / "t000.tif").shape, (4, 4))
+            scaled_mask = tifffile.imread(scaled_mask_dir / "mask000.tif")
+            self.assertEqual(scaled_mask.shape, (4, 4))
+            self.assertEqual(set(np.unique(scaled_mask).tolist()), {0, 1, 2})
+
+            output_paths, csv_path, metrics_rows = export_rescale_overlay_comparisons(
+                original_image_files=sorted(image_dir.glob("*.tif")),
+                original_mask_files=sorted(mask_dir.glob("mask*.tif")),
+                scaled_image_files=sorted(scaled_image_dir.glob("*.tif")),
+                scaled_mask_files=sorted(scaled_mask_dir.glob("mask*.tif")),
+                output_dir=qa_dir,
+                scale=0.5,
+                max_frames=1,
+            )
+
+            self.assertEqual(len(output_paths), 1)
+            self.assertTrue(output_paths[0].is_file())
+            self.assertTrue(csv_path.is_file())
+            self.assertEqual(metrics_rows[0]["lost_labels"], "")
 
 
 if __name__ == "__main__":
