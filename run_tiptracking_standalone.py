@@ -155,7 +155,63 @@ def _track_ids_in_frame(frame: np.ndarray):
     return ids[ids != 0].astype(int)
 
 
-def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray):
+def _active_cooldown_track_ids(cooldown_until: dict[int, int], frame_idx: int):
+    return {track_id for track_id, end_frame in cooldown_until.items() if frame_idx <= end_frame}
+
+
+def _rescue_cooldown_label_swaps(
+    normalized_tensor: np.ndarray,
+    frame_idx: int,
+    newborn_ids: list[int],
+    protected_track_ids: set[int],
+):
+    prev_frame = normalized_tensor[:, :, frame_idx - 1]
+    curr_frame = normalized_tensor[:, :, frame_idx]
+    prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+    curr_ids = set(_track_ids_in_frame(curr_frame).tolist())
+    rescued_ids = set()
+
+    for protected_id in sorted(protected_track_ids):
+        if protected_id not in prev_ids:
+            continue
+        if protected_id in curr_ids:
+            continue
+
+        previous_mask = prev_frame == protected_id
+        if not np.any(previous_mask):
+            continue
+
+        dilated_previous = binary_dilation(previous_mask, np.ones((3, 3), dtype=bool))
+        candidates = []
+        for newborn_id in newborn_ids:
+            if newborn_id in rescued_ids:
+                continue
+            current_mask = curr_frame == newborn_id
+            touch_pixels = int(np.count_nonzero(current_mask & dilated_previous))
+            if touch_pixels > 0:
+                candidates.append((touch_pixels, newborn_id))
+
+        if len(candidates) != 1:
+            continue
+
+        _, rescued_id = candidates[0]
+        for time_idx in range(frame_idx, int(normalized_tensor.shape[2])):
+            frame_t = normalized_tensor[:, :, time_idx]
+            rescue_pixels = frame_t == rescued_id
+            if np.any(rescue_pixels):
+                frame_t[rescue_pixels] = protected_id
+
+        rescued_ids.add(rescued_id)
+        curr_ids.discard(rescued_id)
+        curr_ids.add(protected_id)
+
+    return sorted(track_id for track_id in newborn_ids if track_id not in rescued_ids)
+
+
+def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray, division_cooldown_frames: int = 20):
+    if division_cooldown_frames < 0:
+        raise ValueError("division_cooldown_frames must be >= 0.")
+
     max_uint16 = int(np.iinfo(np.uint16).max)
     max_input_id = int(np.max(final_tracked_tensor)) if final_tracked_tensor.size else 0
     if max_input_id > max_uint16:
@@ -165,6 +221,7 @@ def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray):
     frame_count = int(normalized_tensor.shape[2])
     max_track_id = int(np.max(normalized_tensor)) if normalized_tensor.size else 0
     parent_map = {}
+    cooldown_until: dict[int, int] = {}
 
     # Enforce CTC-style division semantics frame by frame.
     for frame_idx in range(1, frame_count):
@@ -179,14 +236,35 @@ def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray):
         if not newborn_ids:
             continue
 
+        protected_track_ids = (
+            _active_cooldown_track_ids(cooldown_until, frame_idx)
+            if division_cooldown_frames > 0
+            else set()
+        )
+        if protected_track_ids:
+            newborn_ids = _rescue_cooldown_label_swaps(
+                normalized_tensor=normalized_tensor,
+                frame_idx=frame_idx,
+                newborn_ids=newborn_ids,
+                protected_track_ids=protected_track_ids,
+            )
+            prev_frame = normalized_tensor[:, :, frame_idx - 1]
+            curr_frame = normalized_tensor[:, :, frame_idx]
+            prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+            curr_ids = _track_ids_in_frame(curr_frame).tolist()
+            newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
+            if not newborn_ids:
+                continue
+
         mother_to_newborns = {}
+        valid_parent_ids = prev_ids - protected_track_ids
         for newborn_id in newborn_ids:
             child_mask = curr_frame == newborn_id
             mother_id = _infer_parent_id(
                 prev_frame=prev_frame,
                 child_mask=child_mask,
                 child_track_id=newborn_id,
-                valid_track_ids=prev_ids,
+                valid_track_ids=valid_parent_ids,
             )
             if mother_id == 0:
                 continue
@@ -215,6 +293,12 @@ def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray):
             parent_map[continuation_daughter_id] = mother_id
             for newborn_id in sorted(set(mother_to_newborns[mother_id])):
                 parent_map[newborn_id] = mother_id
+
+            if division_cooldown_frames > 0:
+                cooldown_end = frame_idx + division_cooldown_frames
+                cooldown_until[continuation_daughter_id] = cooldown_end
+                for newborn_id in sorted(set(mother_to_newborns[mother_id])):
+                    cooldown_until[newborn_id] = cooldown_end
 
             curr_id_set.discard(mother_id)
             curr_id_set.add(continuation_daughter_id)
@@ -391,11 +475,19 @@ def _validate_res_track_rows(final_tracked_tensor: np.ndarray, rows, frame_range
             raise ValueError(f"Track {track_id} has invalid parent ID {parent_id}.")
 
 
-def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray, output_digits: int):
+def _write_challenge_outputs(
+    result_dir: Path,
+    final_tracked_tensor: np.ndarray,
+    output_digits: int,
+    division_cooldown_frames: int,
+):
     result_dir.mkdir(parents=True, exist_ok=True)
 
     print("[TRACKING] export: normalizing CTC divisions", flush=True)
-    normalized_tensor, division_parent_map = _normalize_ctc_divisions(final_tracked_tensor)
+    normalized_tensor, division_parent_map = _normalize_ctc_divisions(
+        final_tracked_tensor,
+        division_cooldown_frames=division_cooldown_frames,
+    )
 
     print("[TRACKING] export: scanning track frame ranges", flush=True)
     frame_ranges = _scan_track_frame_ranges(normalized_tensor)
@@ -483,12 +575,15 @@ def run_tracking(
     resiz_factor: float,
     strict_matlab_id_matching: bool,
     output_digits: str,
+    division_cooldown_frames: int,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     if down_factor != 1:
         raise ValueError("Challenge export requires down_factor=1 to preserve exact frame indexing.")
     if not np.isclose(resiz_factor, 1.0):
         raise ValueError("Challenge export requires resiz_factor=1.0 to preserve original image geometry.")
+    if division_cooldown_frames < 0:
+        raise ValueError("division_cooldown_frames must be >= 0.")
 
     result_dir = output_dir / f"{pos}_RES"
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -508,6 +603,7 @@ def run_tracking(
         f.write(f"matched_pattern={matched_pattern}\n")
         f.write(f"mask_count={len(files)}\n")
         f.write(f"output_digits={resolved_output_digits}\n")
+        f.write(f"division_cooldown_frames={division_cooldown_frames}\n")
         f.write("mask_files:\n")
         for p in files:
             f.write(f"  {p.name}\n")
@@ -875,6 +971,7 @@ def run_tracking(
             result_dir=result_dir,
             final_tracked_tensor=final_tracked_tensor,
             output_digits=resolved_output_digits,
+            division_cooldown_frames=division_cooldown_frames,
         )
 
         print(
@@ -942,6 +1039,12 @@ def parse_args():
         default="auto",
         help="Digits used for CTC maskT.tif output names: auto or a positive integer (default: auto).",
     )
+    parser.add_argument(
+        "--division-cooldown-frames",
+        default=20,
+        type=int,
+        help="Frames after a detected division where daughter IDs are protected from immediate relabeling (default: 20; 0 disables).",
+    )
     parser.add_argument("--strict-matlab-id-matching", dest="strict_matlab_id_matching", action="store_true")
     parser.add_argument("--no-strict-matlab-id-matching", dest="strict_matlab_id_matching", action="store_false")
     parser.set_defaults(strict_matlab_id_matching=True)
@@ -977,6 +1080,7 @@ def main():
         resiz_factor=args.resiz_factor,
         strict_matlab_id_matching=args.strict_matlab_id_matching,
         output_digits=args.output_digits,
+        division_cooldown_frames=args.division_cooldown_frames,
     )
 
 

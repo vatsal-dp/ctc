@@ -10,7 +10,12 @@ import tifffile
 
 from analyze_tracking_failures import analyze_failures
 from evaluate_ctc_results import summarize_official_logs
-from run_tiptracking_standalone import _compact_labels_in_place, _resolve_output_digits, _split_discontinuous_tracks
+from run_tiptracking_standalone import (
+    _compact_labels_in_place,
+    _normalize_ctc_divisions,
+    _resolve_output_digits,
+    _split_discontinuous_tracks,
+)
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
 from view_tracking_overlay import (
     _build_lineage_layout,
@@ -91,6 +96,78 @@ class CTCPipelineToolTests(unittest.TestCase):
             mask_stack[:, :, 1],
             np.array([[1, 0], [0, 2]], dtype=np.uint32),
         )
+
+    def _division_stack(self, frame_count=3):
+        stack = np.zeros((12, 12, frame_count), dtype=np.uint16)
+        stack[2:8, 2:8, 0] = 1
+        stack[2:5, 2:8, 1:] = 1
+        stack[5:8, 2:8, 1:] = 2
+        return stack
+
+    def test_normalize_ctc_divisions_creates_parent_rows(self):
+        stack = self._division_stack(frame_count=2)
+
+        normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=20)
+
+        self.assertEqual(parent_map, {2: 1, 3: 1})
+        self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), {0, 2, 3})
+        self.assertFalse(np.any(normalized[:, :, 1] == 1))
+
+    def test_division_cooldown_rescues_daughter_label_swap(self):
+        stack = self._division_stack(frame_count=3)
+        stack[5:8, 2:8, 2] = 0
+        stack[5:8, 2:8, 2] = 4
+
+        normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=20)
+
+        self.assertEqual(parent_map, {2: 1, 5: 1})
+        self.assertTrue(np.any(normalized[:, :, 2] == 2))
+        self.assertFalse(np.any(normalized[:, :, 2] == 4))
+
+    def test_division_cooldown_blocks_protected_daughter_as_new_parent(self):
+        stack = self._division_stack(frame_count=3)
+        stack[7:10, 2:8, 2] = 4
+
+        normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=20)
+
+        self.assertNotIn(4, parent_map)
+        self.assertTrue(np.any(normalized[:, :, 2] == 4))
+        self.assertEqual(parent_map, {2: 1, 5: 1})
+
+    def test_division_cooldown_does_not_merge_ambiguous_daughter_swaps(self):
+        stack = self._division_stack(frame_count=3)
+        stack[5:8, 2:8, 2] = 0
+        stack[5:8, 2:5, 2] = 4
+        stack[5:8, 5:8, 2] = 5
+
+        normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=20)
+
+        self.assertTrue(np.any(normalized[:, :, 2] == 4))
+        self.assertTrue(np.any(normalized[:, :, 2] == 5))
+        self.assertFalse(np.any(normalized[:, :, 2] == 2))
+        self.assertEqual(parent_map, {2: 1, 6: 1})
+
+    def test_division_cooldown_allows_repeat_split_after_expiration(self):
+        stack = self._division_stack(frame_count=4)
+        stack[7:10, 2:8, 3] = 4
+
+        normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=1)
+
+        self.assertEqual(parent_map.get(4), 2)
+        self.assertEqual(parent_map.get(2), 1)
+        self.assertTrue(np.any(normalized[:, :, 3] == 4))
+        self.assertFalse(np.any(normalized[:, :, 3] == 2))
+
+    def test_division_cooldown_zero_preserves_unrescued_label_swap(self):
+        stack = self._division_stack(frame_count=3)
+        stack[5:8, 2:8, 2] = 0
+        stack[5:8, 2:8, 2] = 4
+
+        normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=0)
+
+        self.assertEqual(parent_map, {2: 1, 5: 1})
+        self.assertTrue(np.any(normalized[:, :, 2] == 4))
+        self.assertFalse(np.any(normalized[:, :, 2] == 2))
 
     def test_validator_accepts_one_frame_track(self):
         with tempfile.TemporaryDirectory() as tmp:
