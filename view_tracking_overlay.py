@@ -205,40 +205,85 @@ def _build_lineage_layout(track_rows: dict[int, TrackRow]):
     )
 
 
-def _lineage_plot_segments(track_rows: dict[int, TrackRow], lineage_layout: LineageLayout | None, current_frame: int):
+def _lineage_focus_bounds(current_frame: int, max_frame: int, lineage_window: int | None):
+    if lineage_window is None:
+        return 0, max_frame
+    return max(0, current_frame - lineage_window), min(max_frame, current_frame + lineage_window)
+
+
+def _track_overlaps_range(row: TrackRow, start_frame: int, end_frame: int):
+    return row.begin <= end_frame and row.end >= start_frame
+
+
+def _filter_lineage_track_rows(track_rows: dict[int, TrackRow], start_frame: int, end_frame: int):
+    return {
+        track_id: row
+        for track_id, row in track_rows.items()
+        if _track_overlaps_range(row, start_frame, end_frame)
+    }
+
+
+def _lineage_plot_segments(
+    track_rows: dict[int, TrackRow],
+    lineage_layout: LineageLayout | None,
+    current_frame: int,
+    x_start: int | None = None,
+    x_end: int | None = None,
+    reveal_until_frame: int | None = None,
+):
     if not track_rows or lineage_layout is None:
         return {"tracks": [], "connectors": [], "active": []}
 
+    reveal_until = current_frame if reveal_until_frame is None else reveal_until_frame
     track_segments = []
     connector_segments = []
     active_points = []
 
     for track_id, row in sorted(track_rows.items(), key=lambda item: (item[1].begin, item[0])):
-        if current_frame < row.begin:
+        if reveal_until < row.begin:
             continue
 
         y_value = lineage_layout.y_positions[track_id]
+        segment_start = row.begin if x_start is None else max(row.begin, x_start)
+        segment_end = min(row.end, reveal_until)
+        if x_end is not None:
+            segment_end = min(segment_end, x_end)
+
+        if segment_end < segment_start:
+            continue
+
         track_segments.append(
             {
                 "track_id": track_id,
-                "x0": row.begin,
-                "x1": min(row.end, current_frame),
+                "x0": segment_start,
+                "x1": segment_end,
                 "y": y_value,
             }
         )
 
-        if row.begin <= current_frame <= row.end:
+        current_in_view = (
+            row.begin <= current_frame <= row.end
+            and (x_start is None or current_frame >= x_start)
+            and (x_end is None or current_frame <= x_end)
+        )
+        if current_in_view:
             active_points.append({"track_id": track_id, "x": current_frame, "y": y_value})
 
-        if row.parent != 0 and current_frame >= row.begin:
+        if row.parent != 0 and row.parent in track_rows and reveal_until >= row.begin:
             parent_row = track_rows[row.parent]
+            connector_x0 = min(parent_row.end, row.begin)
+            connector_x1 = row.begin
+            if x_start is not None and max(connector_x0, connector_x1) < x_start:
+                continue
+            if x_end is not None and min(connector_x0, connector_x1) > x_end:
+                continue
             connector_segments.append(
                 {
                     "parent_id": row.parent,
                     "child_id": track_id,
-                    "x0": min(parent_row.end, row.begin),
+                    "x0": connector_x0,
                     "y0": lineage_layout.y_positions[row.parent],
-                    "x1": row.begin,
+                    "x1": connector_x1,
                     "y1": y_value,
                 }
             )
@@ -325,11 +370,21 @@ def _create_figure(interactive: bool, has_lineage: bool):
 
 
 class OverlayLineageRenderer:
-    def __init__(self, image_files, mask_files, alpha: float, track_rows: dict[int, TrackRow] | None = None):
+    def __init__(
+        self,
+        image_files,
+        mask_files,
+        alpha: float,
+        track_rows: dict[int, TrackRow] | None = None,
+        lineage_window: int | None = None,
+        lineage_active_only: bool = False,
+    ):
         self.image_files = image_files
         self.mask_files = mask_files
         self.alpha = alpha
         self.track_rows = track_rows or {}
+        self.lineage_window = lineage_window
+        self.lineage_active_only = lineage_active_only
         self.frame_count = min(len(image_files), len(mask_files))
         self.has_lineage = bool(self.track_rows)
         self.color_map = _build_track_color_map(self.track_rows)
@@ -360,7 +415,12 @@ class OverlayLineageRenderer:
 
     def _draw_lineage(self, frame_index: int, lineage_ax):
         lineage_ax.clear()
-        lineage_ax.set_title("Lineage")
+        title_bits = ["Lineage"]
+        if self.lineage_window is not None:
+            title_bits.append(f"+/- {self.lineage_window} frames")
+        if self.lineage_active_only:
+            title_bits.append("active in view")
+        lineage_ax.set_title(" | ".join(title_bits))
 
         if not self.has_lineage or self.lineage_layout is None:
             lineage_ax.text(
@@ -374,7 +434,41 @@ class OverlayLineageRenderer:
             lineage_ax.set_axis_off()
             return
 
-        plot_data = _lineage_plot_segments(self.track_rows, self.lineage_layout, current_frame=frame_index)
+        focus_start, focus_end = _lineage_focus_bounds(
+            current_frame=frame_index,
+            max_frame=self.max_frame,
+            lineage_window=self.lineage_window,
+        )
+        track_rows = self.track_rows
+        lineage_layout = self.lineage_layout
+
+        if self.lineage_active_only:
+            track_rows = _filter_lineage_track_rows(track_rows, focus_start, focus_end)
+            lineage_layout = _build_lineage_layout(track_rows)
+            if not track_rows or lineage_layout is None:
+                lineage_ax.text(
+                    0.5,
+                    0.5,
+                    "No tracks in selected lineage view",
+                    ha="center",
+                    va="center",
+                    transform=lineage_ax.transAxes,
+                )
+                lineage_ax.set_axis_off()
+                return
+
+        x_start = focus_start if self.lineage_window is not None else None
+        x_end = focus_end if self.lineage_window is not None else None
+        reveal_until_frame = focus_end if self.lineage_window is not None else frame_index
+
+        plot_data = _lineage_plot_segments(
+            track_rows,
+            lineage_layout,
+            current_frame=frame_index,
+            x_start=x_start,
+            x_end=x_end,
+            reveal_until_frame=reveal_until_frame,
+        )
 
         for connector in plot_data["connectors"]:
             child_color = self.color_map.get(connector["child_id"], _track_color(connector["child_id"]))
@@ -410,8 +504,11 @@ class OverlayLineageRenderer:
             )
 
         lineage_ax.axvline(frame_index, color="0.2", linewidth=1.0, linestyle="--", alpha=0.45, zorder=0)
-        lineage_ax.set_xlim(-0.5, self.max_frame + 0.5)
-        lineage_ax.set_ylim(self.lineage_layout.max_leaf_row + 0.6, -0.6)
+        if self.lineage_window is None:
+            lineage_ax.set_xlim(-0.5, self.max_frame + 0.5)
+        else:
+            lineage_ax.set_xlim(focus_start - 0.5, focus_end + 0.5)
+        lineage_ax.set_ylim(lineage_layout.max_leaf_row + 0.6, -0.6)
         lineage_ax.set_xlabel("Frame")
         lineage_ax.set_yticks([])
         lineage_ax.grid(axis="x", alpha=0.2, linewidth=0.5)
@@ -482,6 +579,8 @@ def export_overlay_lineage_frames(
     export_dir: Path,
     track_rows: dict[int, TrackRow],
     dpi: int = 150,
+    lineage_window: int | None = None,
+    lineage_active_only: bool = False,
 ):
     if not track_rows:
         raise ValueError("Export mode requires a lineage file with track rows.")
@@ -501,6 +600,8 @@ def export_overlay_lineage_frames(
         mask_files=mask_files,
         alpha=alpha,
         track_rows=track_rows,
+        lineage_window=lineage_window,
+        lineage_active_only=lineage_active_only,
     )
     fig, overlay_ax, lineage_ax = _create_figure(interactive=False, has_lineage=True)
     fig.subplots_adjust(bottom=0.1, wspace=0.08)
@@ -579,6 +680,17 @@ def parse_args():
         type=int,
         help="0-based initial frame index for interactive viewing (default: 0).",
     )
+    parser.add_argument(
+        "--lineage-window",
+        default=None,
+        type=int,
+        help="Show lineage within this many frames before/after the current frame.",
+    )
+    parser.add_argument(
+        "--lineage-active-only",
+        action="store_true",
+        help="Only draw tracks whose lifetime overlaps the current lineage view.",
+    )
     return parser.parse_args()
 
 
@@ -595,6 +707,8 @@ def main():
         raise ValueError("--alpha must be between 0 and 1.")
     if args.dpi <= 0:
         raise ValueError("--dpi must be positive.")
+    if args.lineage_window is not None and args.lineage_window < 0:
+        raise ValueError("--lineage-window must be zero or positive.")
 
     image_files = _load_file_list(
         image_dir,
@@ -624,6 +738,8 @@ def main():
             export_dir=args.export_dir,
             track_rows=track_rows,
             dpi=args.dpi,
+            lineage_window=args.lineage_window,
+            lineage_active_only=args.lineage_active_only,
         )
         print(f"[EXPORT] wrote {len(output_paths)} frames to {args.export_dir.resolve()}")
         if output_paths:
@@ -643,6 +759,8 @@ def main():
         mask_files=mask_files,
         alpha=args.alpha,
         track_rows=track_rows,
+        lineage_window=args.lineage_window,
+        lineage_active_only=args.lineage_active_only,
     )
     viewer = OverlayViewer(renderer=renderer, start_index=args.start_index)
     viewer.show()

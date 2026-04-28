@@ -14,6 +14,7 @@ from run_tiptracking_standalone import _compact_labels_in_place, _resolve_output
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
 from view_tracking_overlay import (
     _build_lineage_layout,
+    _filter_lineage_track_rows,
     _lineage_plot_segments,
     _parse_track_file,
     export_overlay_lineage_frames,
@@ -342,6 +343,36 @@ class CTCPipelineToolTests(unittest.TestCase):
                 {(segment["parent_id"], segment["child_id"]) for segment in after_split["connectors"]},
                 {(1, 2), (1, 3)},
             )
+
+    def test_lineage_window_filters_and_clips_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            track_file = Path(tmp) / "res_track.txt"
+            track_file.write_text("1 0 10 0\n2 12 20 1\n3 30 40 0\n", encoding="utf-8")
+
+            track_rows = _parse_track_file(track_file)
+            focused_rows = _filter_lineage_track_rows(track_rows, start_frame=10, end_frame=20)
+            focused_layout = _build_lineage_layout(focused_rows)
+
+            self.assertEqual(set(focused_rows), {1, 2})
+
+            plot_data = _lineage_plot_segments(
+                focused_rows,
+                focused_layout,
+                current_frame=15,
+                x_start=10,
+                x_end=20,
+                reveal_until_frame=20,
+            )
+
+            segments_by_track = {segment["track_id"]: segment for segment in plot_data["tracks"]}
+            self.assertEqual(set(segments_by_track), {1, 2})
+            self.assertEqual((segments_by_track[1]["x0"], segments_by_track[1]["x1"]), (10, 10))
+            self.assertEqual((segments_by_track[2]["x0"], segments_by_track[2]["x1"]), (12, 20))
+            self.assertEqual(
+                {(segment["parent_id"], segment["child_id"]) for segment in plot_data["connectors"]},
+                {(1, 2)},
+            )
+            self.assertEqual([point["track_id"] for point in plot_data["active"]], [2])
 
     def test_overlay_lineage_export_writes_png_frames(self):
         with tempfile.TemporaryDirectory() as tmp:
