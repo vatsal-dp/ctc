@@ -10,7 +10,7 @@ import tifffile
 
 from analyze_tracking_failures import analyze_failures
 from evaluate_ctc_results import summarize_official_logs
-from run_tiptracking_standalone import _resolve_output_digits
+from run_tiptracking_standalone import _compact_labels_in_place, _resolve_output_digits, _split_discontinuous_tracks
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
 from view_tracking_overlay import (
     _build_lineage_layout,
@@ -29,6 +29,67 @@ class CTCPipelineToolTests(unittest.TestCase):
         self.assertEqual(_resolve_output_digits("5", [Path("mask000.tif")], 28177), 5)
         with self.assertRaises(ValueError):
             _resolve_output_digits("3", [Path("mask000.tif")], 1001)
+
+    def test_discontinuous_split_prunes_after_track_capacity(self):
+        mask_stack = np.zeros((1, 1, 5), dtype=np.uint16)
+        mask_stack[:, :, 0] = 1
+        mask_stack[:, :, 2] = 1
+        mask_stack[:, :, 4] = 1
+        tp_im = np.array([[1, 0, 1, 0, 1]], dtype=np.uint32)
+        tp1 = tp_im != 0
+
+        tp_im, tp1, short_pruned, capacity_pruned = _split_discontinuous_tracks(
+            mask_stack=mask_stack,
+            tp_im=tp_im,
+            tp1=tp1,
+            time_series_threshold=1,
+            max_track_id=2,
+        )
+
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 1)
+        self.assertEqual(tp_im.shape[0], 2)
+        self.assertEqual(mask_stack.reshape(-1).tolist(), [1, 0, 2, 0, 0])
+
+    def test_discontinuous_split_reuses_sparse_label_slots(self):
+        mask_stack = np.zeros((1, 1, 5), dtype=np.uint16)
+        mask_stack[:, :, 0] = 5
+        mask_stack[:, :, 2] = 5
+        mask_stack[:, :, 4] = 5
+        tp_im = np.zeros((5, 5), dtype=np.uint32)
+        tp_im[4, [0, 2, 4]] = 1
+        tp1 = tp_im != 0
+
+        tp_im, tp1, short_pruned, capacity_pruned = _split_discontinuous_tracks(
+            mask_stack=mask_stack,
+            tp_im=tp_im,
+            tp1=tp1,
+            time_series_threshold=1,
+            max_track_id=5,
+        )
+
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 0)
+        self.assertEqual(tp_im.shape[0], 5)
+        self.assertEqual(mask_stack.reshape(-1).tolist(), [5, 0, 1, 0, 2])
+
+    def test_compact_labels_in_place_removes_sparse_raw_ids(self):
+        mask_stack = np.zeros((2, 2, 2), dtype=np.uint32)
+        mask_stack[:, :, 0] = np.array([[0, 10], [70000, 0]], dtype=np.uint32)
+        mask_stack[:, :, 1] = np.array([[10, 0], [0, 42]], dtype=np.uint32)
+
+        label_count, max_label_before = _compact_labels_in_place(mask_stack)
+
+        self.assertEqual(label_count, 3)
+        self.assertEqual(max_label_before, 70000)
+        np.testing.assert_array_equal(
+            mask_stack[:, :, 0],
+            np.array([[0, 1], [3, 0]], dtype=np.uint32),
+        )
+        np.testing.assert_array_equal(
+            mask_stack[:, :, 1],
+            np.array([[1, 0], [0, 2]], dtype=np.uint32),
+        )
 
     def test_validator_accepts_one_frame_track(self):
         with tempfile.TemporaryDirectory() as tmp:

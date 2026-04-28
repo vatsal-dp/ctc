@@ -16,6 +16,10 @@ from skimage.morphology import binary_dilation, erosion, opening, skeletonize
 from skimage.transform import resize
 
 
+_MAX_CTC_TRACK_ID = int(np.iinfo(np.uint16).max)
+_TRACKING_DTYPE = np.uint32
+
+
 def _natural_sort_key(text: str):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
@@ -157,10 +161,7 @@ def _normalize_ctc_divisions(final_tracked_tensor: np.ndarray):
     if max_input_id > max_uint16:
         raise ValueError("Track IDs exceed uint16 capacity required for challenge mask export.")
 
-    if final_tracked_tensor.dtype == np.uint16:
-        normalized_tensor = final_tracked_tensor
-    else:
-        normalized_tensor = final_tracked_tensor.astype(np.uint16, copy=False)
+    normalized_tensor = final_tracked_tensor
     frame_count = int(normalized_tensor.shape[2])
     max_track_id = int(np.max(normalized_tensor)) if normalized_tensor.size else 0
     parent_map = {}
@@ -258,6 +259,92 @@ def _scan_track_frame_ranges(final_tracked_tensor: np.ndarray):
     return {track_id: (bounds[0], bounds[1]) for track_id, bounds in frame_ranges.items()}
 
 
+def _compact_labels_in_place(mask_stack: np.ndarray):
+    labels = np.unique(mask_stack)
+    labels = labels[labels != 0].astype(np.int64, copy=False)
+    if labels.size == 0:
+        return 0, 0
+
+    max_label_before = int(labels[-1])
+    compact_labels = np.arange(1, labels.size + 1, dtype=mask_stack.dtype)
+
+    for frame_idx in range(int(mask_stack.shape[2])):
+        frame = mask_stack[:, :, frame_idx]
+        nonzero = frame != 0
+        if not np.any(nonzero):
+            continue
+        frame_values = frame[nonzero].astype(np.int64, copy=False)
+        frame[nonzero] = compact_labels[np.searchsorted(labels, frame_values)]
+
+    return int(labels.size), max_label_before
+
+
+def _drop_track_fragment(mask_stack: np.ndarray, tp_im: np.ndarray, tp1: np.ndarray, track_id: int, timepoints):
+    for frame_idx in timepoints:
+        mask_2_change = mask_stack[:, :, frame_idx]
+        pixo = mask_2_change == track_id
+        if np.any(pixo):
+            mask_2_change[pixo] = 0
+        tp_im[track_id - 1, frame_idx] = 0
+        tp1[track_id - 1, frame_idx] = False
+
+
+def _split_discontinuous_tracks(
+    mask_stack: np.ndarray,
+    tp_im: np.ndarray,
+    tp1: np.ndarray,
+    time_series_threshold: int,
+    max_track_id: int = _MAX_CTC_TRACK_ID,
+):
+    obj = np.where(np.any(tp_im != 0, axis=1))[0] + 1
+    numb_m1 = int(mask_stack.shape[2])
+    free_label_ids = np.where(~np.any(tp_im != 0, axis=1))[0] + 1
+    free_label_ids = free_label_ids[free_label_ids <= max_track_id]
+    free_label_cursor = 0
+    pruned_short_fragments = 0
+    pruned_capacity_fragments = 0
+
+    for cel1 in obj:
+        if cel1 <= 0 or cel1 > tp1.shape[0]:
+            continue
+        tpz, num_components = bwlabel(tp1[cel1 - 1, :].astype(np.uint8))
+        if num_components <= 1:
+            continue
+
+        for it in range(2, num_components + 1):
+            timepoints_to_change = np.where(tpz == it)[0]
+            if timepoints_to_change.size < time_series_threshold:
+                # Drop tiny disconnected fragments early so they do not consume extra track IDs.
+                _drop_track_fragment(mask_stack, tp_im, tp1, int(cel1), timepoints_to_change)
+                pruned_short_fragments += 1
+                continue
+
+            if free_label_cursor < free_label_ids.size:
+                new_label = int(free_label_ids[free_label_cursor])
+                free_label_cursor += 1
+            elif tp_im.shape[0] < max_track_id:
+                new_label = tp_im.shape[0] + 1
+                tp_im = np.vstack([tp_im, np.zeros((1, numb_m1), dtype=tp_im.dtype)])
+                tp1 = np.vstack([tp1, np.zeros((1, numb_m1), dtype=tp1.dtype)])
+            else:
+                _drop_track_fragment(mask_stack, tp_im, tp1, int(cel1), timepoints_to_change)
+                pruned_capacity_fragments += 1
+                continue
+
+            for it2 in timepoints_to_change:
+                mask_2_change = mask_stack[:, :, it2]
+                pixo = mask_2_change == cel1
+                if np.any(pixo):
+                    mask_2_change[pixo] = new_label
+
+                tp_im[new_label - 1, it2] = tp_im[cel1 - 1, it2]
+                tp_im[cel1 - 1, it2] = 0
+                tp1[new_label - 1, it2] = True
+                tp1[cel1 - 1, it2] = False
+
+    return tp_im, tp1, pruned_short_fragments, pruned_capacity_fragments
+
+
 def _build_res_track_from_parent_map(
     final_tracked_tensor: np.ndarray,
     parent_map: dict[int, int],
@@ -335,7 +422,7 @@ def _write_challenge_outputs(result_dir: Path, final_tracked_tensor: np.ndarray,
             print(f"[TRACKING] export frame {frame_idx + 1}/{total_frames}", flush=True)
         tifffile.imwrite(
             str(result_dir / f"mask{frame_idx:0{output_digits}d}.tif"),
-            normalized_tensor[:, :, frame_idx],
+            normalized_tensor[:, :, frame_idx].astype(np.uint16, copy=False),
         )
 
     final_object_count = max(frame_ranges) if frame_ranges else 0
@@ -437,13 +524,14 @@ def run_tracking(
     first_mask = _read_mask_frame(files[0], resiz_factor)
     frame_shape = first_mask.shape
 
-    tracked_stack_path = output_dir / f"{pos}_tracked_stack_{time.time_ns()}.uint16.mmap"
+    tracked_stack_path = output_dir / f"{pos}_tracked_stack_{time.time_ns()}.{np.dtype(_TRACKING_DTYPE).name}.mmap"
 
-    bytes_per_frame = frame_shape[0] * frame_shape[1] * np.dtype(np.uint16).itemsize
+    bytes_per_frame = frame_shape[0] * frame_shape[1] * np.dtype(_TRACKING_DTYPE).itemsize
     estimated_stack_gib = (bytes_per_frame * im_no) / (1024**3)
     print(
         f"[TRACKING] low-memory mode: disk-backed stack={tracked_stack_path} "
-        f"shape={frame_shape} frames={im_no} estimated_size={estimated_stack_gib:.2f} GiB"
+        f"dtype={np.dtype(_TRACKING_DTYPE).name} shape={frame_shape} "
+        f"frames={im_no} estimated_size={estimated_stack_gib:.2f} GiB"
     )
 
     tracked_stack = None
@@ -454,12 +542,12 @@ def run_tracking(
         tracked_stack = np.memmap(
             tracked_stack_path,
             mode="w+",
-            dtype=np.uint16,
+            dtype=_TRACKING_DTYPE,
             shape=(frame_shape[0], frame_shape[1], im_no),
         )
 
-        is1 = np.copy(first_mask).astype(np.uint16)
-        iblank_g = np.zeros(is1.shape, dtype=np.uint16)
+        is1 = np.copy(first_mask).astype(_TRACKING_DTYPE)
+        iblank_g = np.zeros(is1.shape, dtype=_TRACKING_DTYPE)
         max_id_ever = int(np.max(is1)) if np.max(is1) > 0 else 0
 
         tic = time.time()
@@ -705,11 +793,11 @@ def run_tracking(
                         iblank[isb == it2] = assigned_id
                     max_id_ever += len(newcells)
 
-                tracked_stack[:, :, it0] = np.uint16(iblank).copy()
+                tracked_stack[:, :, it0] = iblank.astype(_TRACKING_DTYPE, copy=False)
                 is1 = tracked_stack[:, :, it0].copy()
             else:
                 tracked_stack[:, :, it0] = is2.copy()
-                is1 = is2.copy()
+                is1 = tracked_stack[:, :, it0].copy()
                 if it0 == 0 or max_id_ever == 0:
                     max_id_ever = int(np.max(is2)) if np.max(is2) > 0 else 0
 
@@ -717,10 +805,19 @@ def run_tracking(
         print(f"[TRACKING] main_loop_elapsed={elapsed_time:.2f}s")
         tracked_stack.flush()
 
-        print("[TRACKING] post: preparing downsampled mask stack", flush=True)
+        print("[TRACKING] post: compacting raw tracker labels", flush=True)
         mask0 = tracked_stack
+        raw_track_count, raw_max_label = _compact_labels_in_place(mask0)
+        if raw_track_count > 0:
+            print(
+                f"[TRACKING] post: raw tracker labels used={raw_track_count} "
+                f"max_label_before_compaction={raw_max_label}",
+                flush=True,
+            )
+
+        print("[TRACKING] post: preparing downsampled mask stack", flush=True)
         dz = int(mask0.shape[2])
-        max_id = int(np.max(mask0)) if np.max(mask0) > 0 else 0
+        max_id = raw_track_count
         numb_m1 = int(mask0.shape[2])
         tp_im = np.zeros((max_id, numb_m1), dtype=np.uint32)
         if max_id > 0:
@@ -731,53 +828,27 @@ def run_tracking(
                 counts = np.bincount(mask0[:, :, ih].ravel(), minlength=max_id + 1)
                 tp_im[:, ih] = counts[1:].astype(np.uint32, copy=False)
 
-        obj = np.where(np.any(tp_im != 0, axis=1))[0] + 1
         tp1 = tp_im != 0
 
-        print(f"[TRACKING] post: resolving discontinuous tracks across {len(obj)} objects", flush=True)
-        pruned_short_fragments = 0
-        for cel1 in obj:
-            if cel1 <= 0 or cel1 > tp1.shape[0]:
-                continue
-            tpz, num_components = bwlabel(tp1[cel1 - 1, :].astype(np.uint8))
-            if num_components > 1:
-                for it in range(2, num_components + 1):
-                    timepoints_to_change = np.where(tpz == it)[0]
-                    if timepoints_to_change.size < time_series_threshold:
-                        # Drop tiny disconnected fragments early so they do not consume extra track IDs.
-                        for it2 in timepoints_to_change:
-                            mask_2_change = mask0[:, :, it2]
-                            pixo = mask_2_change == cel1
-                            if np.any(pixo):
-                                mask_2_change[pixo] = 0
-                            tp_im[cel1 - 1, it2] = 0
-                            tp1[cel1 - 1, it2] = False
-                        pruned_short_fragments += 1
-                        continue
-                    new_length = tp_im.shape[0] + 1
-                    if new_length > np.iinfo(np.uint16).max:
-                        raise ValueError(
-                            "Track count exceeded uint16 capacity during discontinuity splitting. "
-                            "Try increasing --time-series-threshold to discard short fragments, "
-                            "or improve segmentation continuity."
-                        )
-                    tp_im = np.vstack([tp_im, np.zeros((1, numb_m1), dtype=tp_im.dtype)])
-                    tp1 = np.vstack([tp1, np.zeros((1, numb_m1), dtype=tp1.dtype)])
-
-                    for it2 in timepoints_to_change:
-                        mask_2_change = mask0[:, :, it2]
-                        pixo = mask_2_change == cel1
-                        if np.any(pixo):
-                            mask_2_change[pixo] = new_length
-
-                        tp_im[new_length - 1, it2] = tp_im[cel1 - 1, it2]
-                        tp_im[cel1 - 1, it2] = 0
-                        tp1[new_length - 1, it2] = True
-                        tp1[cel1 - 1, it2] = False
+        object_count = int(np.count_nonzero(np.any(tp_im != 0, axis=1)))
+        print(f"[TRACKING] post: resolving discontinuous tracks across {object_count} objects", flush=True)
+        tp_im, tp1, pruned_short_fragments, pruned_capacity_fragments = _split_discontinuous_tracks(
+            mask_stack=mask0,
+            tp_im=tp_im,
+            tp1=tp1,
+            time_series_threshold=time_series_threshold,
+        )
         if pruned_short_fragments > 0:
             print(
                 f"[TRACKING] post: pruned {pruned_short_fragments} disconnected fragments "
                 f"shorter than time-series-threshold={time_series_threshold}",
+                flush=True,
+            )
+        if pruned_capacity_fragments > 0:
+            print(
+                f"[TRACKING] post: pruned {pruned_capacity_fragments} disconnected fragments "
+                f"after reaching the uint16 CTC label limit ({_MAX_CTC_TRACK_ID}); "
+                "increase --time-series-threshold to prefer longer surviving tracks",
                 flush=True,
             )
 
