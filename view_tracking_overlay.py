@@ -208,7 +208,7 @@ def _build_lineage_layout(track_rows: dict[int, TrackRow]):
 def _lineage_focus_bounds(current_frame: int, max_frame: int, lineage_window: int | None):
     if lineage_window is None:
         return 0, max_frame
-    return max(0, current_frame - lineage_window), min(max_frame, current_frame + lineage_window)
+    return max(0, current_frame - lineage_window), min(max_frame, current_frame)
 
 
 def _track_overlaps_range(row: TrackRow, start_frame: int, end_frame: int):
@@ -417,7 +417,7 @@ class OverlayLineageRenderer:
         lineage_ax.clear()
         title_bits = ["Lineage"]
         if self.lineage_window is not None:
-            title_bits.append(f"+/- {self.lineage_window} frames")
+            title_bits.append(f"previous {self.lineage_window} frames")
         if self.lineage_active_only:
             title_bits.append("active in view")
         lineage_ax.set_title(" | ".join(title_bits))
@@ -459,7 +459,7 @@ class OverlayLineageRenderer:
 
         x_start = focus_start if self.lineage_window is not None else None
         x_end = focus_end if self.lineage_window is not None else None
-        reveal_until_frame = focus_end if self.lineage_window is not None else frame_index
+        reveal_until_frame = frame_index
 
         plot_data = _lineage_plot_segments(
             track_rows,
@@ -684,7 +684,7 @@ def parse_args():
         "--lineage-window",
         default=None,
         type=int,
-        help="Show lineage within this many frames before/after the current frame.",
+        help="Show lineage from this many frames before the current frame through the current frame.",
     )
     parser.add_argument(
         "--lineage-active-only",

@@ -350,7 +350,7 @@ class CTCPipelineToolTests(unittest.TestCase):
             track_file.write_text("1 0 10 0\n2 12 20 1\n3 30 40 0\n", encoding="utf-8")
 
             track_rows = _parse_track_file(track_file)
-            focused_rows = _filter_lineage_track_rows(track_rows, start_frame=10, end_frame=20)
+            focused_rows = _filter_lineage_track_rows(track_rows, start_frame=10, end_frame=15)
             focused_layout = _build_lineage_layout(focused_rows)
 
             self.assertEqual(set(focused_rows), {1, 2})
@@ -360,14 +360,14 @@ class CTCPipelineToolTests(unittest.TestCase):
                 focused_layout,
                 current_frame=15,
                 x_start=10,
-                x_end=20,
-                reveal_until_frame=20,
+                x_end=15,
+                reveal_until_frame=15,
             )
 
             segments_by_track = {segment["track_id"]: segment for segment in plot_data["tracks"]}
             self.assertEqual(set(segments_by_track), {1, 2})
             self.assertEqual((segments_by_track[1]["x0"], segments_by_track[1]["x1"]), (10, 10))
-            self.assertEqual((segments_by_track[2]["x0"], segments_by_track[2]["x1"]), (12, 20))
+            self.assertEqual((segments_by_track[2]["x0"], segments_by_track[2]["x1"]), (12, 15))
             self.assertEqual(
                 {(segment["parent_id"], segment["child_id"]) for segment in plot_data["connectors"]},
                 {(1, 2)},
