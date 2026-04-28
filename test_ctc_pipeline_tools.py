@@ -116,6 +116,13 @@ class CTCPipelineToolTests(unittest.TestCase):
         stack[5:8, 2:8, 1:] = 3
         return stack
 
+    def _uneven_division_stack_with_disappeared_mother(self, frame_count=2):
+        stack = np.zeros((12, 12, frame_count), dtype=np.uint16)
+        stack[2:10, 2:10, 0] = 1
+        stack[2:8, 2:10, 1:] = 2
+        stack[8:10, 2:10, 1:] = 3
+        return stack
+
     def _division_stack_with_reused_daughter_label(self, frame_count=2):
         stack = np.zeros((12, 12, frame_count), dtype=np.uint16)
         stack[2:8, 2:8, 0] = 1
@@ -149,6 +156,17 @@ class CTCPipelineToolTests(unittest.TestCase):
 
         self.assertEqual(parent_map, {2: 1, 3: 1})
         self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), {0, 2, 3})
+        self.assertFalse(np.any(normalized[:, :, 1] == 1))
+
+    def test_ram_normalize_ctc_divisions_keeps_uneven_daughters_new(self):
+        stack = self._uneven_division_stack_with_disappeared_mother(frame_count=2)
+
+        normalized, parent_map = _normalize_ctc_divisions_ram(stack, division_cooldown_frames=20)
+
+        daughter_ids = set(parent_map)
+        self.assertEqual(set(parent_map.values()), {1})
+        self.assertEqual(len(daughter_ids), 2)
+        self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), daughter_ids | {0})
         self.assertFalse(np.any(normalized[:, :, 1] == 1))
 
     def test_normalize_ctc_divisions_forks_reused_daughter_label(self):

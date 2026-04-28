@@ -538,6 +538,7 @@ def _rescue_identity_continuity(
     max_rescue_gap: int = 1,
     rescue_confidence_threshold: float = 0.30,
     max_centroid_dist_px: float = 50.0,
+    excluded_lost_ids: set[int] | None = None,
     audit_log: list | None = None,
 ) -> None:
     """General identity-continuity rescue pass (operates in-place).
@@ -573,6 +574,8 @@ def _rescue_identity_continuity(
     frame_count = int(normalized_tensor.shape[2])
     if audit_log is None:
         audit_log = []
+    if excluded_lost_ids is None:
+        excluded_lost_ids = set()
 
     # Track which IDs have already been used as a rescue target in this pass
     # to prevent one candidate label from being claimed by two lost tracks.
@@ -591,6 +594,14 @@ def _rescue_identity_continuity(
             continue
 
         for lost_id in sorted(disappeared):
+            if lost_id in excluded_lost_ids:
+                audit_log.append({
+                    "event": "skip_excluded_parent",
+                    "lost_id": lost_id,
+                    "frame": frame_idx,
+                })
+                continue
+
             ref_mask = prev_frame == lost_id
             if not np.any(ref_mask):
                 continue
@@ -684,9 +695,11 @@ def _log_rescue_summary(audit_log: list, label: str = "identity-continuity rescu
     rescued = [e for e in audit_log if e["event"] == "rescued"]
     ambiguous = [e for e in audit_log if e["event"] == "skip_ambiguous"]
     no_cand = [e for e in audit_log if e["event"] == "skip_no_candidate"]
+    excluded = [e for e in audit_log if e["event"] == "skip_excluded_parent"]
     print(
         f"[TRACKING] {label}: rescued={len(rescued)} "
-        f"ambiguous_skipped={len(ambiguous)} no_candidate_skipped={len(no_cand)}",
+        f"ambiguous_skipped={len(ambiguous)} no_candidate_skipped={len(no_cand)} "
+        f"division_parent_skipped={len(excluded)}",
         flush=True,
     )
     for e in rescued:
@@ -852,6 +865,7 @@ def _normalize_ctc_divisions(
             max_rescue_gap=identity_rescue_gap,
             rescue_confidence_threshold=rescue_confidence_threshold,
             max_centroid_dist_px=max_centroid_dist_px,
+            excluded_lost_ids=set(parent_map.values()),
             audit_log=post_audit,
         )
         _log_rescue_summary(post_audit, label="post-division identity rescue")
