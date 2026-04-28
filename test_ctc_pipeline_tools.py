@@ -16,6 +16,9 @@ from run_tiptracking_standalone import (
     _resolve_output_digits,
     _split_discontinuous_tracks,
 )
+from ram_run_tiptracking_standalone_optimized import (
+    _normalize_ctc_divisions as _normalize_ctc_divisions_ram,
+)
 from rescale_image_mask_pairs import rescale_dataset, resize_mask_array
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
 from visualize_rescale_overlay import export_rescale_overlay_comparisons
@@ -106,10 +109,35 @@ class CTCPipelineToolTests(unittest.TestCase):
         stack[5:8, 2:8, 1:] = 2
         return stack
 
+    def _division_stack_with_disappeared_mother(self, frame_count=2):
+        stack = np.zeros((12, 12, frame_count), dtype=np.uint16)
+        stack[2:8, 2:8, 0] = 1
+        stack[2:5, 2:8, 1:] = 2
+        stack[5:8, 2:8, 1:] = 3
+        return stack
+
     def test_normalize_ctc_divisions_creates_parent_rows(self):
         stack = self._division_stack(frame_count=2)
 
         normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=20)
+
+        self.assertEqual(parent_map, {2: 1, 3: 1})
+        self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), {0, 2, 3})
+        self.assertFalse(np.any(normalized[:, :, 1] == 1))
+
+    def test_normalize_ctc_divisions_handles_two_newborn_daughters(self):
+        stack = self._division_stack_with_disappeared_mother(frame_count=2)
+
+        normalized, parent_map = _normalize_ctc_divisions(stack, division_cooldown_frames=20)
+
+        self.assertEqual(parent_map, {2: 1, 3: 1})
+        self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), {0, 2, 3})
+        self.assertFalse(np.any(normalized[:, :, 1] == 1))
+
+    def test_ram_normalize_ctc_divisions_handles_two_newborn_daughters(self):
+        stack = self._division_stack_with_disappeared_mother(frame_count=2)
+
+        normalized, parent_map = _normalize_ctc_divisions_ram(stack, division_cooldown_frames=20)
 
         self.assertEqual(parent_map, {2: 1, 3: 1})
         self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), {0, 2, 3})

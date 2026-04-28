@@ -760,33 +760,36 @@ def _normalize_ctc_divisions(
 
         curr_id_set = set(curr_ids)
         for mother_id in sorted(mother_to_newborns):
-            if mother_id not in curr_id_set:
+            newborns = sorted(set(mother_to_newborns[mother_id]))
+            daughter_ids = list(newborns)
+
+            if mother_id in curr_id_set:
+                max_track_id += 1
+                if max_track_id > max_uint16:
+                    raise ValueError("Division normalization would exceed uint16 track ID capacity.")
+                continuation_daughter_id = max_track_id
+
+                # Mother must end at f-1; relabel continuation branch from frame f onward.
+                for time_idx in range(frame_idx, frame_count):
+                    frame_t = normalized_tensor[:, :, time_idx]
+                    mother_pixels = frame_t == mother_id
+                    if np.any(mother_pixels):
+                        frame_t[mother_pixels] = continuation_daughter_id
+
+                parent_map[continuation_daughter_id] = mother_id
+                daughter_ids.append(continuation_daughter_id)
+                curr_id_set.discard(mother_id)
+                curr_id_set.add(continuation_daughter_id)
+            elif len(newborns) < 2:
                 continue
 
-            max_track_id += 1
-            if max_track_id > max_uint16:
-                raise ValueError("Division normalization would exceed uint16 track ID capacity.")
-            continuation_daughter_id = max_track_id
-
-            # Mother must end at f-1; relabel continuation branch from frame f onward.
-            for time_idx in range(frame_idx, frame_count):
-                frame_t = normalized_tensor[:, :, time_idx]
-                mother_pixels = frame_t == mother_id
-                if np.any(mother_pixels):
-                    frame_t[mother_pixels] = continuation_daughter_id
-
-            parent_map[continuation_daughter_id] = mother_id
-            for newborn_id in sorted(set(mother_to_newborns[mother_id])):
+            for newborn_id in newborns:
                 parent_map[newborn_id] = mother_id
 
             if division_cooldown_frames > 0:
                 cooldown_end = frame_idx + division_cooldown_frames
-                cooldown_until[continuation_daughter_id] = cooldown_end
-                for newborn_id in sorted(set(mother_to_newborns[mother_id])):
-                    cooldown_until[newborn_id] = cooldown_end
-
-            curr_id_set.discard(mother_id)
-            curr_id_set.add(continuation_daughter_id)
+                for daughter_id in daughter_ids:
+                    cooldown_until[daughter_id] = cooldown_end
 
     # -----------------------------------------------------------------------
     # Stage 3 (optional): Second identity-continuity rescue pass AFTER
