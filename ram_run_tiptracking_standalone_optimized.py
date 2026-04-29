@@ -298,25 +298,54 @@ def _format_gib(byte_count: int | float) -> str:
     return f"{byte_count / (1024**3):.2f} GiB"
 
 
-def _choose_mmap_dir(output_dir: Path, mmap_dir: Path | None, estimated_stack_bytes: int) -> Path:
-    if mmap_dir is None:
-        if _looks_like_network_path(output_dir):
-            mmap_dir = Path(tempfile.gettempdir()) / "tiptracking_mmap"
-        else:
-            mmap_dir = output_dir
+def _default_mmap_candidates(output_dir: Path) -> list[Path]:
+    if not _looks_like_network_path(output_dir):
+        return [output_dir]
 
-    mmap_dir.mkdir(parents=True, exist_ok=True)
+    candidates = [Path(tempfile.gettempdir()) / "tiptracking_mmap"]
+    if os.name == "nt":
+        temp_drive = Path(tempfile.gettempdir()).drive.upper()
+        for letter in "DEFGHIJKLMNOPQRSTUVWXYZC":
+            drive = f"{letter}:"
+            if drive == temp_drive:
+                continue
+            candidates.append(Path(f"{drive}\\tiptracking_mmap"))
 
+    return candidates
+
+
+def _probe_mmap_dir(candidate: Path) -> tuple[int | None, OSError | None]:
     try:
-        free_bytes = shutil.disk_usage(mmap_dir).free
-    except OSError:
-        free_bytes = None
+        candidate.mkdir(parents=True, exist_ok=True)
+        return shutil.disk_usage(candidate).free, None
+    except OSError as exc:
+        return None, exc
 
-    if free_bytes is not None and free_bytes < estimated_stack_bytes:
+
+def _choose_mmap_dir(output_dir: Path, mmap_dir: Path | None, estimated_stack_bytes: int) -> Path:
+    candidates = [mmap_dir] if mmap_dir is not None else _default_mmap_candidates(output_dir)
+    rejected: list[str] = []
+
+    for candidate in candidates:
+        free_bytes, error = _probe_mmap_dir(candidate)
+        if error is not None:
+            rejected.append(f"{candidate} unavailable ({error})")
+            continue
+        if free_bytes is not None and free_bytes < estimated_stack_bytes:
+            rejected.append(
+                f"{candidate} has only {_format_gib(free_bytes)} free"
+            )
+            continue
+
+        mmap_dir = candidate
+        break
+    else:
+        details = "; ".join(rejected) if rejected else "no candidates were usable"
         raise RuntimeError(
-            f"Temporary mmap directory {mmap_dir} has only {_format_gib(free_bytes)} free, "
-            f"but the tracking stack needs about {_format_gib(estimated_stack_bytes)}. "
-            "Pass --mmap-dir pointing to a local scratch disk with enough space."
+            f"No temporary mmap directory has enough free space for the "
+            f"{_format_gib(estimated_stack_bytes)} tracking stack: {details}. "
+            "Pass --mmap-dir pointing to a local scratch disk with enough space, "
+            "for example --mmap-dir D:\\tiptracking_mmap."
         )
 
     if mmap_dir != output_dir:
