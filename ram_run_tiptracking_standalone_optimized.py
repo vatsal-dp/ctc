@@ -6,6 +6,8 @@ import gc
 import os
 import queue
 import re
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -285,6 +287,46 @@ def _remap_stack_with_lut(
             continue
         clipped = np.clip(frame, 0, lut_max)
         mask_stack[:, :, frame_idx] = lut[clipped]
+
+
+def _looks_like_network_path(path: Path) -> bool:
+    text = str(path)
+    return text.startswith("\\\\") or text.startswith("//")
+
+
+def _format_gib(byte_count: int | float) -> str:
+    return f"{byte_count / (1024**3):.2f} GiB"
+
+
+def _choose_mmap_dir(output_dir: Path, mmap_dir: Path | None, estimated_stack_bytes: int) -> Path:
+    if mmap_dir is None:
+        if _looks_like_network_path(output_dir):
+            mmap_dir = Path(tempfile.gettempdir()) / "tiptracking_mmap"
+        else:
+            mmap_dir = output_dir
+
+    mmap_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        free_bytes = shutil.disk_usage(mmap_dir).free
+    except OSError:
+        free_bytes = None
+
+    if free_bytes is not None and free_bytes < estimated_stack_bytes:
+        raise RuntimeError(
+            f"Temporary mmap directory {mmap_dir} has only {_format_gib(free_bytes)} free, "
+            f"but the tracking stack needs about {_format_gib(estimated_stack_bytes)}. "
+            "Pass --mmap-dir pointing to a local scratch disk with enough space."
+        )
+
+    if mmap_dir != output_dir:
+        free_text = f" free={_format_gib(free_bytes)}" if free_bytes is not None else ""
+        print(
+            f"[TRACKING] low-memory mode: using mmap scratch dir={mmap_dir}{free_text}",
+            flush=True,
+        )
+
+    return mmap_dir
 
 
 def _natural_sort_key(text: str):
@@ -1244,6 +1286,7 @@ def run_tracking(
     io_workers: int = 1,
     io_queue_depth: int = 4,
     tiff_write_workers: int = 4,
+    mmap_dir: Path | None = None,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     if down_factor != 1:
@@ -1278,6 +1321,7 @@ def run_tracking(
         f.write(f"io_workers={io_workers}\n")
         f.write(f"io_queue_depth={io_queue_depth}\n")
         f.write(f"tiff_write_workers={tiff_write_workers}\n")
+        f.write(f"mmap_dir={mmap_dir if mmap_dir is not None else 'auto'}\n")
         f.write("mask_files:\n")
         for p in files:
             f.write(f"  {p.name}\n")
@@ -1294,14 +1338,14 @@ def run_tracking(
     first_mask = _read_mask_frame(files[0], resiz_factor)
     frame_shape = first_mask.shape
 
-    tracked_stack_path = output_dir / f"{pos}_tracked_stack_{time.time_ns()}.{np.dtype(_TRACKING_DTYPE).name}.mmap"
-
     bytes_per_frame = frame_shape[0] * frame_shape[1] * np.dtype(_TRACKING_DTYPE).itemsize
-    estimated_stack_gib = (bytes_per_frame * im_no) / (1024**3)
+    estimated_stack_bytes = bytes_per_frame * im_no
+    mmap_root = _choose_mmap_dir(output_dir, mmap_dir, estimated_stack_bytes)
+    tracked_stack_path = mmap_root / f"{pos}_tracked_stack_{time.time_ns()}.{np.dtype(_TRACKING_DTYPE).name}.mmap"
     print(
         f"[TRACKING] low-memory mode: disk-backed stack={tracked_stack_path} "
         f"dtype={np.dtype(_TRACKING_DTYPE).name} shape={frame_shape} "
-        f"frames={im_no} estimated_size={estimated_stack_gib:.2f} GiB"
+        f"frames={im_no} estimated_size={_format_gib(estimated_stack_bytes)}"
     )
 
     tracked_stack = None
@@ -1795,6 +1839,16 @@ def parse_args():
             "Increase on fast storage; 1 disables parallelism."
         ),
     )
+    parser.add_argument(
+        "--mmap-dir",
+        default=None,
+        type=Path,
+        help=(
+            "Directory for the temporary disk-backed tracking stack. By default, UNC/network "
+            "output paths use a local temp scratch folder and local output paths use output-dir. "
+            "Set this to a fast local SSD folder when processing masks from a network share."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1808,6 +1862,7 @@ def main():
         if args.output_dir is not None
         else script_dir / f"output_{time.strftime('%Y%m%d_%H%M%S')}"
     ).resolve()
+    mmap_dir = args.mmap_dir.expanduser().resolve() if args.mmap_dir is not None else None
 
     if not mask_dir.exists() or not mask_dir.is_dir():
         raise NotADirectoryError(
@@ -1834,6 +1889,7 @@ def main():
         io_workers=args.io_workers,
         io_queue_depth=args.io_queue_depth,
         tiff_write_workers=args.tiff_write_workers,
+        mmap_dir=mmap_dir,
     )
 
 

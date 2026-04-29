@@ -17,6 +17,8 @@ from run_tiptracking_standalone import (
     _split_discontinuous_tracks,
 )
 from ram_run_tiptracking_standalone_optimized import (
+    _choose_mmap_dir,
+    _looks_like_network_path,
     _normalize_ctc_divisions as _normalize_ctc_divisions_ram,
     _split_discontinuous_tracks as _split_discontinuous_tracks_ram,
 )
@@ -33,6 +35,16 @@ from view_tracking_overlay import (
 
 
 class CTCPipelineToolTests(unittest.TestCase):
+    def test_mmap_dir_selection_uses_local_output_dir_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "tracking_output"
+            self.assertEqual(_choose_mmap_dir(output_dir, None, estimated_stack_bytes=1), output_dir)
+
+    def test_network_path_detection_for_unc_paths(self):
+        self.assertTrue(_looks_like_network_path(Path(r"\\server\share\tracking_output")))
+        self.assertTrue(_looks_like_network_path(Path("//server/share/tracking_output")))
+        self.assertFalse(_looks_like_network_path(Path("/tmp/tracking_output")))
+
     def test_output_digits_auto_and_bounds(self):
         self.assertEqual(_resolve_output_digits("auto", [Path("mask000.tif")], 2), 3)
         self.assertEqual(_resolve_output_digits("auto", [Path("mask0000.tif")], 2), 4)
