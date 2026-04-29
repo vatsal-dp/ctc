@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 import tifffile
 from scipy.ndimage import convolve, rotate
-from scipy.ndimage import label as bwlabel
 from scipy.stats import mode
 from skimage.measure import label, regionprops
 from skimage.morphology import binary_dilation, erosion, opening, skeletonize
@@ -940,6 +939,81 @@ def _drop_track_fragment(mask_stack: np.ndarray, tp_im: np.ndarray, tp1: np.ndar
         tp1[track_id - 1, frame_idx] = False
 
 
+def _contiguous_true_runs(present: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return half-open [start, end) runs for a 1-D boolean presence row."""
+    if present.size == 0 or not np.any(present):
+        empty = np.array([], dtype=np.intp)
+        return empty, empty
+
+    padded = np.empty(present.size + 2, dtype=np.int8)
+    padded[0] = 0
+    padded[-1] = 0
+    padded[1:-1] = present.astype(np.int8, copy=False)
+    edges = np.flatnonzero(np.diff(padded))
+    return edges[0::2].astype(np.intp, copy=False), edges[1::2].astype(np.intp, copy=False)
+
+
+def _queue_frame_relabels(
+    frame_relabels: list[list[tuple[int, int]] | None],
+    start_frame: int,
+    end_frame: int,
+    old_label: int,
+    new_label: int,
+) -> None:
+    for frame_idx in range(start_frame, end_frame):
+        actions = frame_relabels[frame_idx]
+        if actions is None:
+            frame_relabels[frame_idx] = [(old_label, new_label)]
+        else:
+            actions.append((old_label, new_label))
+
+
+def _apply_frame_relabels(
+    mask_stack: np.ndarray,
+    frame_relabels: list[list[tuple[int, int]] | None],
+    lut_size: int,
+) -> None:
+    affected_frames = [frame_idx for frame_idx, actions in enumerate(frame_relabels) if actions]
+    if not affected_frames:
+        return
+
+    total_actions = sum(len(frame_relabels[frame_idx]) for frame_idx in affected_frames)
+    print(
+        f"[TRACKING] post: applying {total_actions} fragment label maps "
+        f"across {len(affected_frames)} affected frames",
+        flush=True,
+    )
+
+    base_lut = np.arange(max(lut_size, 1), dtype=mask_stack.dtype)
+    for done, frame_idx in enumerate(affected_frames, start=1):
+        if done % 1000 == 0 or done == len(affected_frames):
+            print(
+                f"[TRACKING] post discontinuity remap frame {done}/{len(affected_frames)}",
+                flush=True,
+            )
+
+        frame = mask_stack[:, :, frame_idx]
+        frame_max = int(np.max(frame)) if frame.size > 0 else 0
+        if frame_max >= base_lut.size:
+            lut = np.arange(frame_max + 1, dtype=mask_stack.dtype)
+            lut[:base_lut.size] = base_lut
+        else:
+            lut = base_lut.copy()
+
+        actions = frame_relabels[frame_idx]
+        if actions is None:
+            continue
+
+        for old_label, new_label in actions:
+            if old_label >= lut.size:
+                expanded_lut = np.arange(old_label + 1, dtype=mask_stack.dtype)
+                expanded_lut[:lut.size] = lut
+                lut = expanded_lut
+            lut[old_label] = new_label
+
+        mask_stack[:, :, frame_idx] = lut[frame]
+
+
 def _split_discontinuous_tracks(
     mask_stack: np.ndarray,
     tp_im: np.ndarray,
@@ -952,46 +1026,64 @@ def _split_discontinuous_tracks(
     free_label_ids = np.where(~np.any(tp_im != 0, axis=1))[0] + 1
     free_label_ids = free_label_ids[free_label_ids <= max_track_id]
     free_label_cursor = 0
+    next_appended_label = int(tp_im.shape[0]) + 1
     pruned_short_fragments = 0
     pruned_capacity_fragments = 0
+    frame_relabels: list[list[tuple[int, int]] | None] = [None] * numb_m1
+    assigned_fragments: list[tuple[int, int, int, int]] = []
+    dropped_fragments: list[tuple[int, int, int]] = []
+    max_assigned_label = int(tp_im.shape[0])
 
     for cel1 in obj:
         if cel1 <= 0 or cel1 > tp1.shape[0]:
             continue
-        tpz, num_components = bwlabel(tp1[cel1 - 1, :].astype(np.uint8))
-        if num_components <= 1:
+        starts, ends = _contiguous_true_runs(tp1[cel1 - 1, :])
+        if starts.size <= 1:
             continue
 
-        for it in range(2, num_components + 1):
-            timepoints_to_change = np.where(tpz == it)[0]
-            if timepoints_to_change.size < time_series_threshold:
+        for start_frame, end_frame in zip(starts[1:].tolist(), ends[1:].tolist()):
+            fragment_len = end_frame - start_frame
+            if fragment_len < time_series_threshold:
                 # Drop tiny disconnected fragments early so they do not consume extra track IDs.
-                _drop_track_fragment(mask_stack, tp_im, tp1, int(cel1), timepoints_to_change)
+                dropped_fragments.append((int(cel1), start_frame, end_frame))
+                _queue_frame_relabels(frame_relabels, start_frame, end_frame, int(cel1), 0)
                 pruned_short_fragments += 1
                 continue
 
             if free_label_cursor < free_label_ids.size:
                 new_label = int(free_label_ids[free_label_cursor])
                 free_label_cursor += 1
-            elif tp_im.shape[0] < max_track_id:
-                new_label = tp_im.shape[0] + 1
-                tp_im = np.vstack([tp_im, np.zeros((1, numb_m1), dtype=tp_im.dtype)])
-                tp1 = np.vstack([tp1, np.zeros((1, numb_m1), dtype=tp1.dtype)])
+            elif next_appended_label <= max_track_id:
+                new_label = next_appended_label
+                next_appended_label += 1
             else:
-                _drop_track_fragment(mask_stack, tp_im, tp1, int(cel1), timepoints_to_change)
+                dropped_fragments.append((int(cel1), start_frame, end_frame))
+                _queue_frame_relabels(frame_relabels, start_frame, end_frame, int(cel1), 0)
                 pruned_capacity_fragments += 1
                 continue
 
-            for it2 in timepoints_to_change:
-                mask_2_change = mask_stack[:, :, it2]
-                pixo = mask_2_change == cel1
-                if np.any(pixo):
-                    mask_2_change[pixo] = new_label
+            max_assigned_label = max(max_assigned_label, new_label)
+            assigned_fragments.append((int(cel1), new_label, start_frame, end_frame))
+            _queue_frame_relabels(frame_relabels, start_frame, end_frame, int(cel1), new_label)
 
-                tp_im[new_label - 1, it2] = tp_im[cel1 - 1, it2]
-                tp_im[cel1 - 1, it2] = 0
-                tp1[new_label - 1, it2] = True
-                tp1[cel1 - 1, it2] = False
+    if max_assigned_label > tp_im.shape[0]:
+        add_rows = max_assigned_label - tp_im.shape[0]
+        tp_im = np.vstack([tp_im, np.zeros((add_rows, numb_m1), dtype=tp_im.dtype)])
+        tp1 = np.vstack([tp1, np.zeros((add_rows, numb_m1), dtype=tp1.dtype)])
+
+    for cel1, new_label, start_frame, end_frame in assigned_fragments:
+        frames = slice(start_frame, end_frame)
+        tp_im[new_label - 1, frames] = tp_im[cel1 - 1, frames]
+        tp_im[cel1 - 1, frames] = 0
+        tp1[new_label - 1, frames] = True
+        tp1[cel1 - 1, frames] = False
+
+    for cel1, start_frame, end_frame in dropped_fragments:
+        frames = slice(start_frame, end_frame)
+        tp_im[cel1 - 1, frames] = 0
+        tp1[cel1 - 1, frames] = False
+
+    _apply_frame_relabels(mask_stack, frame_relabels, max(max_assigned_label, int(tp_im.shape[0])) + 1)
 
     return tp_im, tp1, pruned_short_fragments, pruned_capacity_fragments
 

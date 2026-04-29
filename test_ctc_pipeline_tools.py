@@ -18,6 +18,7 @@ from run_tiptracking_standalone import (
 )
 from ram_run_tiptracking_standalone_optimized import (
     _normalize_ctc_divisions as _normalize_ctc_divisions_ram,
+    _split_discontinuous_tracks as _split_discontinuous_tracks_ram,
 )
 from rescale_image_mask_pairs import rescale_dataset, resize_mask_array
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
@@ -72,6 +73,49 @@ class CTCPipelineToolTests(unittest.TestCase):
         tp1 = tp_im != 0
 
         tp_im, tp1, short_pruned, capacity_pruned = _split_discontinuous_tracks(
+            mask_stack=mask_stack,
+            tp_im=tp_im,
+            tp1=tp1,
+            time_series_threshold=1,
+            max_track_id=5,
+        )
+
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 0)
+        self.assertEqual(tp_im.shape[0], 5)
+        self.assertEqual(mask_stack.reshape(-1).tolist(), [5, 0, 1, 0, 2])
+
+    def test_ram_discontinuous_split_prunes_after_track_capacity(self):
+        mask_stack = np.zeros((1, 1, 5), dtype=np.uint16)
+        mask_stack[:, :, 0] = 1
+        mask_stack[:, :, 2] = 1
+        mask_stack[:, :, 4] = 1
+        tp_im = np.array([[1, 0, 1, 0, 1]], dtype=np.uint32)
+        tp1 = tp_im != 0
+
+        tp_im, tp1, short_pruned, capacity_pruned = _split_discontinuous_tracks_ram(
+            mask_stack=mask_stack,
+            tp_im=tp_im,
+            tp1=tp1,
+            time_series_threshold=1,
+            max_track_id=2,
+        )
+
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 1)
+        self.assertEqual(tp_im.shape[0], 2)
+        self.assertEqual(mask_stack.reshape(-1).tolist(), [1, 0, 2, 0, 0])
+
+    def test_ram_discontinuous_split_reuses_sparse_label_slots(self):
+        mask_stack = np.zeros((1, 1, 5), dtype=np.uint16)
+        mask_stack[:, :, 0] = 5
+        mask_stack[:, :, 2] = 5
+        mask_stack[:, :, 4] = 5
+        tp_im = np.zeros((5, 5), dtype=np.uint32)
+        tp_im[4, [0, 2, 4]] = 1
+        tp1 = tp_im != 0
+
+        tp_im, tp1, short_pruned, capacity_pruned = _split_discontinuous_tracks_ram(
             mask_stack=mask_stack,
             tp_im=tp_im,
             tp1=tp1,
