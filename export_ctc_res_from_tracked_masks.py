@@ -15,6 +15,7 @@ import tifffile
 IMAGE_SUFFIXES = {".tif", ".tiff"}
 MAX_UINT16 = int(np.iinfo(np.uint16).max)
 PREFERRED_PICKLE_KEYS = (
+    "Final_tracked_tensor",
     "tracked_masks",
     "tracked_mask",
     "track_masks",
@@ -234,6 +235,266 @@ def _contiguous_runs(frames: list[int]):
     return runs
 
 
+def _track_ids_in_frame(frame: np.ndarray):
+    ids = np.unique(frame)
+    return ids[ids != 0].astype(int)
+
+
+def _binary_dilation_3x3(mask: np.ndarray):
+    mask = np.asarray(mask, dtype=bool)
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    out = np.zeros_like(mask, dtype=bool)
+    for row_offset in range(3):
+        for col_offset in range(3):
+            out |= padded[row_offset : row_offset + mask.shape[0], col_offset : col_offset + mask.shape[1]]
+    return out
+
+
+def _infer_parent_id(
+    prev_frame: np.ndarray,
+    child_mask: np.ndarray,
+    child_track_id: int,
+    valid_track_ids: set[int],
+    min_touch_pixels: int,
+    min_touch_ratio: float,
+) -> int:
+    child_pixels = int(np.count_nonzero(child_mask))
+    if child_pixels == 0:
+        return 0
+
+    dilated_child = _binary_dilation_3x3(child_mask)
+    touching_labels = prev_frame[dilated_child]
+    touching_labels = touching_labels[touching_labels != 0]
+    if touching_labels.size == 0:
+        return 0
+
+    labels, counts = np.unique(touching_labels.astype(np.int64, copy=False), return_counts=True)
+    candidates = []
+    for label_val, count in zip(labels.tolist(), counts.tolist()):
+        parent_id = int(label_val)
+        if parent_id == child_track_id or parent_id not in valid_track_ids:
+            continue
+        candidates.append((int(count), parent_id))
+
+    if not candidates:
+        return 0
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    best_touch_count, best_parent_id = candidates[0]
+    if best_touch_count < min_touch_pixels:
+        return 0
+    if (best_touch_count / child_pixels) < min_touch_ratio:
+        return 0
+    return best_parent_id
+
+
+def _has_self_continuity(
+    prev_frame: np.ndarray,
+    curr_frame: np.ndarray,
+    track_id: int,
+    min_touch_pixels: int,
+    min_touch_ratio: float,
+) -> bool:
+    previous_mask = prev_frame == track_id
+    current_mask = curr_frame == track_id
+    current_pixels = int(np.count_nonzero(current_mask))
+    if current_pixels == 0 or not np.any(previous_mask):
+        return False
+
+    dilated_previous = _binary_dilation_3x3(previous_mask)
+    touch_pixels = int(np.count_nonzero(current_mask & dilated_previous))
+    if touch_pixels < min_touch_pixels:
+        return False
+    return (touch_pixels / current_pixels) >= min_touch_ratio
+
+
+def _fork_existing_daughter_label(
+    frames: list[np.ndarray],
+    child_id: int,
+    frame_idx: int,
+    new_child_id: int,
+) -> None:
+    for time_idx in range(frame_idx, len(frames)):
+        frame_t = frames[time_idx]
+        child_pixels = frame_t == child_id
+        if np.any(child_pixels):
+            frame_t[child_pixels] = new_child_id
+
+
+def _active_cooldown_track_ids(cooldown_until: dict[int, int], frame_idx: int):
+    return {track_id for track_id, end_frame in cooldown_until.items() if frame_idx <= end_frame}
+
+
+def _rescue_cooldown_label_swaps(
+    frames: list[np.ndarray],
+    frame_idx: int,
+    newborn_ids: list[int],
+    protected_track_ids: set[int],
+):
+    prev_frame = frames[frame_idx - 1]
+    curr_frame = frames[frame_idx]
+    prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+    curr_ids = set(_track_ids_in_frame(curr_frame).tolist())
+    rescued_ids = set()
+
+    for protected_id in sorted(protected_track_ids):
+        if protected_id not in prev_ids or protected_id in curr_ids:
+            continue
+
+        previous_mask = prev_frame == protected_id
+        if not np.any(previous_mask):
+            continue
+
+        dilated_previous = _binary_dilation_3x3(previous_mask)
+        candidates = []
+        for newborn_id in newborn_ids:
+            if newborn_id in rescued_ids:
+                continue
+            current_mask = curr_frame == newborn_id
+            touch_pixels = int(np.count_nonzero(current_mask & dilated_previous))
+            if touch_pixels > 0:
+                candidates.append((touch_pixels, newborn_id))
+
+        if len(candidates) != 1:
+            continue
+
+        _, rescued_id = candidates[0]
+        for time_idx in range(frame_idx, len(frames)):
+            frame_t = frames[time_idx]
+            rescue_pixels = frame_t == rescued_id
+            if np.any(rescue_pixels):
+                frame_t[rescue_pixels] = protected_id
+
+        rescued_ids.add(rescued_id)
+        curr_ids.discard(rescued_id)
+        curr_ids.add(protected_id)
+
+    return sorted(track_id for track_id in newborn_ids if track_id not in rescued_ids)
+
+
+def _normalize_ctc_divisions(
+    frames: list[np.ndarray],
+    division_cooldown_frames: int,
+    min_touch_pixels: int,
+    min_touch_ratio: float,
+):
+    if division_cooldown_frames < 0:
+        raise ValueError("--division-cooldown-frames must be >= 0.")
+
+    max_existing_id = max((int(np.max(frame)) for frame in frames if frame.size), default=0)
+    if max_existing_id > MAX_UINT16:
+        raise ValueError("Track IDs exceed uint16 capacity required for CTC export.")
+
+    frame_count = len(frames)
+    max_track_id = max_existing_id
+    parent_map: dict[int, int] = {}
+    cooldown_until: dict[int, int] = {}
+
+    for frame_idx in range(1, frame_count):
+        if frame_idx % 250 == 0 or frame_idx == frame_count - 1:
+            print(f"[EXPORT] division inference frame {frame_idx + 1}/{frame_count}", flush=True)
+
+        prev_frame = frames[frame_idx - 1]
+        curr_frame = frames[frame_idx]
+        prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+        if not prev_ids:
+            continue
+
+        curr_ids = _track_ids_in_frame(curr_frame).tolist()
+        newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
+        protected_track_ids = (
+            _active_cooldown_track_ids(cooldown_until, frame_idx)
+            if division_cooldown_frames > 0
+            else set()
+        )
+
+        if protected_track_ids and newborn_ids:
+            newborn_ids = _rescue_cooldown_label_swaps(
+                frames=frames,
+                frame_idx=frame_idx,
+                newborn_ids=newborn_ids,
+                protected_track_ids=protected_track_ids,
+            )
+            prev_frame = frames[frame_idx - 1]
+            curr_frame = frames[frame_idx]
+            prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+            curr_ids = _track_ids_in_frame(curr_frame).tolist()
+            newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
+
+        mother_to_children: dict[int, list[int]] = {}
+        newborn_id_set = set(newborn_ids)
+        valid_parent_ids = prev_ids - protected_track_ids
+
+        for child_id in curr_ids:
+            if child_id in prev_ids and _has_self_continuity(
+                prev_frame,
+                curr_frame,
+                child_id,
+                min_touch_pixels=min_touch_pixels,
+                min_touch_ratio=min_touch_ratio,
+            ):
+                continue
+            child_mask = curr_frame == child_id
+            mother_id = _infer_parent_id(
+                prev_frame=prev_frame,
+                child_mask=child_mask,
+                child_track_id=child_id,
+                valid_track_ids=valid_parent_ids,
+                min_touch_pixels=min_touch_pixels,
+                min_touch_ratio=min_touch_ratio,
+            )
+            if mother_id != 0:
+                mother_to_children.setdefault(mother_id, []).append(child_id)
+
+        if not mother_to_children:
+            continue
+
+        curr_id_set = set(curr_ids)
+        for mother_id in sorted(mother_to_children):
+            child_ids = sorted(set(mother_to_children[mother_id]))
+            daughter_ids = []
+
+            if mother_id in curr_id_set:
+                max_track_id += 1
+                if max_track_id > MAX_UINT16:
+                    raise ValueError("Division inference would exceed uint16 track ID capacity.")
+                continuation_daughter_id = max_track_id
+
+                for time_idx in range(frame_idx, frame_count):
+                    frame_t = frames[time_idx]
+                    mother_pixels = frame_t == mother_id
+                    if np.any(mother_pixels):
+                        frame_t[mother_pixels] = continuation_daughter_id
+
+                parent_map[continuation_daughter_id] = mother_id
+                daughter_ids.append(continuation_daughter_id)
+                curr_id_set.discard(mother_id)
+                curr_id_set.add(continuation_daughter_id)
+            elif len(child_ids) < 2:
+                continue
+
+            for child_id in child_ids:
+                if child_id in newborn_id_set:
+                    daughter_id = child_id
+                else:
+                    max_track_id += 1
+                    if max_track_id > MAX_UINT16:
+                        raise ValueError("Division inference would exceed uint16 track ID capacity.")
+                    daughter_id = max_track_id
+                    _fork_existing_daughter_label(frames, child_id, frame_idx, daughter_id)
+                    curr_id_set.discard(child_id)
+                    curr_id_set.add(daughter_id)
+                parent_map[daughter_id] = mother_id
+                daughter_ids.append(daughter_id)
+
+            if division_cooldown_frames > 0:
+                cooldown_end = frame_idx + division_cooldown_frames
+                for daughter_id in daughter_ids:
+                    cooldown_until[daughter_id] = cooldown_end
+
+    return frames, parent_map
+
+
 def _scan_label_frames(frames: list[np.ndarray]):
     label_frames: dict[int, list[int]] = {}
     reference_shape = tuple(frames[0].shape)
@@ -247,18 +508,46 @@ def _scan_label_frames(frames: list[np.ndarray]):
     return label_frames
 
 
-def _build_track_runs(label_frames: dict[int, list[int]]):
-    rows: list[TrackRun] = []
+def _build_track_runs(label_frames: dict[int, list[int]], parent_map: dict[int, int] | None = None):
+    parent_map = parent_map or {}
+    rows_without_parents: list[TrackRun] = []
+    rows_by_old_label: dict[int, list[TrackRun]] = {}
     split_labels = 0
     for old_label in sorted(label_frames):
         runs = _contiguous_runs(label_frames[old_label])
         if len(runs) > 1:
             split_labels += 1
         for begin, end in runs:
-            new_label = len(rows) + 1
+            new_label = len(rows_without_parents) + 1
             if new_label > MAX_UINT16:
                 raise ValueError("Generated track count exceeds uint16 capacity.")
-            rows.append(TrackRun(old_label=old_label, label=new_label, begin=begin, end=end))
+            row = TrackRun(old_label=old_label, label=new_label, begin=begin, end=end)
+            rows_without_parents.append(row)
+            rows_by_old_label.setdefault(old_label, []).append(row)
+
+    rows: list[TrackRun] = []
+    for row in rows_without_parents:
+        parent = 0
+        parent_old_label = int(parent_map.get(row.old_label, 0))
+        if parent_old_label != 0 and row.begin > 0:
+            parent_candidates = [
+                candidate
+                for candidate in rows_by_old_label.get(parent_old_label, [])
+                if candidate.end < row.begin
+            ]
+            if parent_candidates:
+                parent = max(parent_candidates, key=lambda candidate: (candidate.end, candidate.label)).label
+                if parent == row.label:
+                    parent = 0
+        rows.append(
+            TrackRun(
+                old_label=row.old_label,
+                label=row.label,
+                begin=row.begin,
+                end=row.end,
+                parent=parent,
+            )
+        )
     return rows, split_labels
 
 
@@ -282,22 +571,46 @@ def _prepare_output_dir(output_dir: Path, overwrite: bool):
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
-def export_ctc_result(frames: list[np.ndarray], output_dir: Path, output_digits: str, overwrite: bool, dry_run: bool):
+def export_ctc_result(
+    frames: list[np.ndarray],
+    output_dir: Path,
+    output_digits: str,
+    overwrite: bool,
+    dry_run: bool,
+    infer_divisions: bool = False,
+    division_cooldown_frames: int = 20,
+    min_touch_pixels: int = 10,
+    min_touch_ratio: float = 0.05,
+):
     if not frames:
         raise ValueError("No frames to export.")
     frame_count = len(frames)
     digits = _parse_output_digits(output_digits, frame_count)
+    parent_map: dict[int, int] = {}
+    if infer_divisions:
+        print("[EXPORT] inferring CTC-style division parents from tracked masks", flush=True)
+        frames, parent_map = _normalize_ctc_divisions(
+            frames=frames,
+            division_cooldown_frames=division_cooldown_frames,
+            min_touch_pixels=min_touch_pixels,
+            min_touch_ratio=min_touch_ratio,
+        )
+
     label_frames = _scan_label_frames(frames)
-    rows, split_labels = _build_track_runs(label_frames)
+    rows, split_labels = _build_track_runs(label_frames, parent_map=parent_map)
     frame_maps = _build_frame_maps(rows, frame_count)
+    parent_rows = sum(1 for row in rows if row.parent != 0)
 
     print(
         "[EXPORT] "
         f"frames={frame_count} original_labels={len(label_frames)} ctc_tracks={len(rows)} "
-        f"labels_split_for_gaps={split_labels} digits={digits}",
+        f"parented_tracks={parent_rows} labels_split_for_gaps={split_labels} digits={digits}",
         flush=True,
     )
-    print("[EXPORT] parent IDs are written as 0 because no lineage metadata was provided.", flush=True)
+    if not infer_divisions:
+        print("[EXPORT] parent IDs are written as 0 because division inference is disabled.", flush=True)
+    elif parent_rows == 0:
+        print("[EXPORT] no parent-child division events passed the inference thresholds.", flush=True)
 
     if dry_run:
         return rows
@@ -337,6 +650,29 @@ def parse_args():
         ),
     )
     parser.add_argument("--output-digits", default="auto", help="Output mask index width: auto or a positive integer.")
+    parser.add_argument(
+        "--infer-divisions",
+        action="store_true",
+        help="Infer CTC parent IDs from adjacent-frame mask contact and relabel mother continuations as daughters.",
+    )
+    parser.add_argument(
+        "--division-cooldown-frames",
+        default=20,
+        type=int,
+        help="Frames after division where daughter IDs are protected from becoming new mothers.",
+    )
+    parser.add_argument(
+        "--min-touch-pixels",
+        default=10,
+        type=int,
+        help="Minimum dilated-contact pixels needed to assign a parent.",
+    )
+    parser.add_argument(
+        "--min-touch-ratio",
+        default=0.05,
+        type=float,
+        help="Minimum contact pixels divided by child pixels needed to assign a parent.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing non-empty output folder.")
     parser.add_argument("--dry-run", action="store_true", help="Scan and report without writing output files.")
     parser.add_argument("--inspect-only", action="store_true", help="For pickle input: print structure and exit.")
@@ -362,6 +698,10 @@ def main():
             output_digits=args.output_digits,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
+            infer_divisions=args.infer_divisions,
+            division_cooldown_frames=args.division_cooldown_frames,
+            min_touch_pixels=args.min_touch_pixels,
+            min_touch_ratio=args.min_touch_ratio,
         )
     except Exception as exc:
         print(f"[EXPORT] FAIL: {exc}", file=sys.stderr)
