@@ -607,6 +607,41 @@ class CTCPipelineToolTests(unittest.TestCase):
             self.assertEqual(resized.dtype, np.uint16)
             self.assertEqual(set(np.unique(resized).tolist()), {0, 1})
 
+    def test_temporal_downsample_can_pad_missing_selected_frames_with_empty_masks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "01_interp_RES"
+            output_dir = root / "eval" / "01_RES"
+            input_dir.mkdir()
+
+            for frame_idx in [0, 16]:
+                mask = np.zeros((8, 8), dtype=np.uint16)
+                mask[2:6, 2:6] = 7
+                tifffile.imwrite(input_dir / f"mask{frame_idx:03d}.tif", mask)
+            (input_dir / "res_track.txt").write_text("7 0 16 0\n", encoding="utf-8")
+
+            report = temporal_downsample_ctc_results(
+                input_result_dir=input_dir,
+                output_result_dir=output_dir,
+                source_root=None,
+                sequence="01",
+                source_frame_count=4,
+                target_shape=(4, 4),
+                pad_missing_with_empty=True,
+                factor=16,
+                offset=0,
+            )
+
+            self.assertEqual(report["missing_selected_frames"], 2)
+            self.assertEqual([path.name for path in sorted(output_dir.glob("mask*.tif"))], [
+                "mask000.tif",
+                "mask001.tif",
+                "mask002.tif",
+                "mask003.tif",
+            ])
+            self.assertEqual(set(np.unique(tifffile.imread(output_dir / "mask002.tif")).tolist()), {0})
+            self.assertEqual(tifffile.imread(output_dir / "mask002.tif").shape, (4, 4))
+
     def test_temporal_downsample_preserves_valid_parent_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

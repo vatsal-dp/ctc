@@ -236,11 +236,13 @@ def _contiguous_runs(frames: list[int]):
     return runs
 
 
-def _scan_sampled_label_frames(selected_mask_files: list[Path]):
+def _scan_sampled_label_frames(selected_mask_files: list[Path | None]):
     label_frames: dict[int, list[int]] = {}
     reference_shape = None
 
     for output_frame_idx, mask_path in enumerate(selected_mask_files):
+        if mask_path is None:
+            continue
         mask = _read_mask(mask_path)
         mask_shape = tuple(mask.shape)
         if reference_shape is None:
@@ -332,6 +334,7 @@ def temporal_downsample_ctc_results(
     sequence: str,
     source_frame_count: int | None = None,
     target_shape: tuple[int, int] | None = None,
+    pad_missing_with_empty: bool = False,
     factor: int = 16,
     offset: int = 0,
     output_digits: str = "auto",
@@ -376,12 +379,23 @@ def temporal_downsample_ctc_results(
     missing = [index for index in selected_input_indices if index not in input_masks]
     if missing:
         preview = ", ".join(str(index) for index in missing[:20])
-        raise ValueError(
-            f"Input result does not contain all selected frames for factor={factor}, offset={offset}. "
-            f"Missing input mask indices: {preview}"
+        if not pad_missing_with_empty:
+            raise ValueError(
+                f"Input result does not contain all selected frames for factor={factor}, offset={offset}. "
+                f"Missing input mask indices: {preview}. Pass --pad-missing-with-empty to write blank "
+                "prediction masks for unavailable frames."
+            )
+        print(
+            "[TEMPORAL DOWNSAMPLE] warning: "
+            f"padding {len(missing)} missing selected frame(s) with empty masks; first missing: {preview}",
+            flush=True,
         )
-    selected_mask_files = [input_masks[index] for index in selected_input_indices]
+    selected_mask_files = [input_masks.get(index) for index in selected_input_indices]
 
+    first_available_mask = next((path for path in selected_mask_files if path is not None), None)
+    blank_shape = target_shape
+    if blank_shape is None and first_available_mask is not None:
+        blank_shape = tuple(_read_mask(first_available_mask).shape)
     label_frames, reference_shape = _scan_sampled_label_frames(selected_mask_files)
     input_rows = _parse_input_tracks(input_result_dir / "res_track.txt")
     output_rows = _build_output_tracks(label_frames, input_rows)
@@ -389,7 +403,12 @@ def temporal_downsample_ctc_results(
 
     _clear_ctc_outputs(output_result_dir)
     for output_frame_idx, input_mask_path in enumerate(selected_mask_files):
-        mask = _read_mask(input_mask_path)
+        if input_mask_path is None:
+            if blank_shape is None:
+                raise ValueError("Cannot write empty mask before an available frame establishes the output shape.")
+            mask = np.zeros(blank_shape, dtype=np.uint16)
+        else:
+            mask = _read_mask(input_mask_path)
         relabeled = _relabel_mask(mask, frame_label_maps[output_frame_idx])
         if target_shape is not None:
             relabeled = _resize_label_mask_to_shape(relabeled, target_shape)
@@ -413,6 +432,7 @@ def temporal_downsample_ctc_results(
         "output_result_dir": output_result_dir,
         "selected_first": selected_input_indices[0] if selected_input_indices else None,
         "selected_last": selected_input_indices[-1] if selected_input_indices else None,
+        "missing_selected_frames": len(missing),
         "shape": reference_shape,
         "target_shape": target_shape,
     }
@@ -447,6 +467,11 @@ def parse_args():
             "the first GT mask shape is used."
         ),
     )
+    parser.add_argument(
+        "--pad-missing-with-empty",
+        action="store_true",
+        help="Write blank result masks for selected interpolated frames that are missing from the input result.",
+    )
     parser.add_argument("--sequence", required=True, type=str, help="Sequence ID, e.g. 01 or 02.")
     parser.add_argument("--factor", default=16, type=int, help="Temporal downsample factor (default: 16).")
     parser.add_argument("--offset", default=0, type=int, help="First interpolated frame to keep (default: 0).")
@@ -472,6 +497,7 @@ def main():
                 if args.target_shape is None
                 else tuple(_parse_positive_int(part, "--target-shape") for part in args.target_shape.split(","))
             ),
+            pad_missing_with_empty=args.pad_missing_with_empty,
             factor=args.factor,
             offset=args.offset,
             output_digits=args.output_digits,
@@ -485,6 +511,7 @@ def main():
         f"sequence={report['sequence']} factor={report['factor']} offset={report['offset']} "
         f"frames={report['frames']} tracks={report['tracks']} digits={report['digits']} "
         f"selected={report['selected_first']}..{report['selected_last']} "
+        f"missing_selected_frames={report['missing_selected_frames']} "
         f"output={report['output_result_dir']}"
     )
     return 0
