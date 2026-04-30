@@ -220,6 +220,13 @@ def _read_input(input_path: Path, pattern: str, time_axis: str, inspect_only: bo
     raise ValueError(f"Unsupported input type: {input_path}. Use a mask folder or .pkl file.")
 
 
+def _transform_frames(frames: list[np.ndarray], transpose_spatial: bool):
+    if not transpose_spatial:
+        return frames
+    print("[EXPORT] transposing each mask frame from (Y, X) to (X, Y)", flush=True)
+    return [np.ascontiguousarray(frame.T) for frame in frames]
+
+
 def _contiguous_runs(frames: list[int]):
     if not frames:
         return []
@@ -651,6 +658,11 @@ def parse_args():
     )
     parser.add_argument("--output-digits", default="auto", help="Output mask index width: auto or a positive integer.")
     parser.add_argument(
+        "--transpose-spatial",
+        action="store_true",
+        help="Transpose each output mask frame. Use when RES shape is the reverse of GT shape.",
+    )
+    parser.add_argument(
         "--infer-divisions",
         action="store_true",
         help="Infer CTC parent IDs from adjacent-frame mask contact and relabel mother continuations as daughters.",
@@ -692,6 +704,7 @@ def main():
         )
         if args.inspect_only:
             return 0
+        frames = _transform_frames(frames, transpose_spatial=args.transpose_spatial)
         export_ctc_result(
             frames=frames,
             output_dir=args.output_result_dir,
