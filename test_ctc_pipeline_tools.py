@@ -18,6 +18,7 @@ from run_tiptracking_standalone import (
 )
 from ram_run_tiptracking_standalone_optimized import (
     _choose_mmap_dir,
+    _compact_labels_in_place_fast,
     _looks_like_network_path,
     _normalize_ctc_divisions as _normalize_ctc_divisions_ram,
     _split_discontinuous_tracks as _split_discontinuous_tracks_ram,
@@ -158,6 +159,20 @@ class CTCPipelineToolTests(unittest.TestCase):
             np.array([[1, 0], [0, 2]], dtype=np.uint32),
         )
 
+    def test_ram_fast_compaction_matches_standalone_compaction(self):
+        original = np.zeros((2, 3, 3), dtype=np.uint32)
+        original[:, :, 0] = np.array([[0, 10, 10], [70000, 0, 42]], dtype=np.uint32)
+        original[:, :, 1] = np.array([[42, 0, 0], [10, 99, 0]], dtype=np.uint32)
+        original[:, :, 2] = np.array([[0, 99, 70000], [0, 0, 0]], dtype=np.uint32)
+        standalone_stack = original.copy()
+        ram_stack = original.copy()
+
+        standalone_result = _compact_labels_in_place(standalone_stack)
+        ram_result = _compact_labels_in_place_fast(ram_stack)
+
+        self.assertEqual(ram_result, standalone_result)
+        np.testing.assert_array_equal(ram_stack, standalone_stack)
+
     def _division_stack(self, frame_count=3):
         stack = np.zeros((12, 12, frame_count), dtype=np.uint16)
         stack[2:8, 2:8, 0] = 1
@@ -186,6 +201,19 @@ class CTCPipelineToolTests(unittest.TestCase):
         stack[2:5, 2:8, 1:] = 2
         stack[5:8, 2:8, 1:] = 3
         return stack
+
+    def _assert_ram_normalize_matches_standalone(self, stack, division_cooldown_frames=20):
+        standalone_normalized, standalone_parent_map = _normalize_ctc_divisions(
+            stack.copy(),
+            division_cooldown_frames=division_cooldown_frames,
+        )
+        ram_normalized, ram_parent_map = _normalize_ctc_divisions_ram(
+            stack.copy(),
+            division_cooldown_frames=division_cooldown_frames,
+        )
+
+        self.assertEqual(ram_parent_map, standalone_parent_map)
+        np.testing.assert_array_equal(ram_normalized, standalone_normalized)
 
     def test_normalize_ctc_divisions_creates_parent_rows(self):
         stack = self._division_stack(frame_count=2)
@@ -247,6 +275,28 @@ class CTCPipelineToolTests(unittest.TestCase):
         self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), set(parent_map) | {0})
         self.assertFalse(np.any(normalized[:, :, 1] == 1))
         self.assertFalse(np.any(normalized[:, :, 1] == 2))
+
+    def test_ram_normalize_ctc_divisions_matches_standalone_general_label_swap(self):
+        stack = np.zeros((8, 8, 3), dtype=np.uint16)
+        stack[2:6, 2:6, 0] = 1
+        stack[2:6, 2:6, 1] = 1
+        stack[2:6, 2:6, 2] = 2
+
+        self._assert_ram_normalize_matches_standalone(stack, division_cooldown_frames=20)
+
+    def test_ram_normalize_ctc_divisions_matches_standalone_cooldown_zero(self):
+        stack = self._division_stack(frame_count=3)
+        stack[5:8, 2:8, 2] = 0
+        stack[5:8, 2:8, 2] = 4
+
+        self._assert_ram_normalize_matches_standalone(stack, division_cooldown_frames=0)
+
+    def test_ram_normalize_ctc_divisions_matches_standalone_daughter_cooldown_rescue(self):
+        stack = self._division_stack(frame_count=3)
+        stack[5:8, 2:8, 2] = 0
+        stack[5:8, 2:8, 2] = 4
+
+        self._assert_ram_normalize_matches_standalone(stack, division_cooldown_frames=20)
 
     def test_division_cooldown_rescues_daughter_label_swap(self):
         stack = self._division_stack(frame_count=3)

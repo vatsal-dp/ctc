@@ -117,7 +117,7 @@ def _run_sequence(args, script_dir: Path, sequence: str):
         mask_dir = _mask_dir_for_sequence(source_root, sequence, args.mask_dir_template)
         command = [
             str(python_exe),
-            str(_script_path(script_dir, "run_tiptracking_standalone.py")),
+            str(_script_path(script_dir, "ram_run_tiptracking_standalone_optimized.py")),
             "--mask-dir",
             str(mask_dir),
             "--mask-pattern",
@@ -252,7 +252,7 @@ def parse_args():
         "--no-strict-matlab-id-matching",
         dest="strict_matlab_id_matching",
         action="store_false",
-        help="Pass through to run_tiptracking_standalone.py.",
+        help="Pass through to the tracking runner.",
     )
     parser.set_defaults(strict_matlab_id_matching=True)
     parser.add_argument("--continue-on-error", action="store_true", help="Continue with later sequences after a failure.")

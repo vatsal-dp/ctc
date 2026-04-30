@@ -213,18 +213,13 @@ def _write_tiff_parallel(
     """Write all frames as uint16 TIFFs using a thread-pool."""
     total = int(tensor.shape[2])
 
-    def _write_one(args):
-        frame_idx, path, data = args
-        tifffile.imwrite(str(path), data)
-
-    tasks = []
-    for frame_idx in range(total):
+    def _write_one(frame_idx):
         path = result_dir / f"mask{frame_idx:0{output_digits}d}.tif"
         data = tensor[:, :, frame_idx].astype(np.uint16, copy=False)
-        tasks.append((frame_idx, path, data))
+        tifffile.imwrite(str(path), data)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
-        list(ex.map(_write_one, tasks))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(n_workers))) as ex:
+        list(ex.map(_write_one, range(total)))
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +524,55 @@ def _active_cooldown_track_ids(cooldown_until: dict[int, int], frame_idx: int):
     return {track_id for track_id, end_frame in cooldown_until.items() if frame_idx <= end_frame}
 
 
+def _rescue_cooldown_label_swaps(
+    normalized_tensor: np.ndarray,
+    frame_idx: int,
+    newborn_ids: list[int],
+    protected_track_ids: set[int],
+):
+    prev_frame = normalized_tensor[:, :, frame_idx - 1]
+    curr_frame = normalized_tensor[:, :, frame_idx]
+    prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+    curr_ids = set(_track_ids_in_frame(curr_frame).tolist())
+    rescued_ids = set()
+
+    for protected_id in sorted(protected_track_ids):
+        if protected_id not in prev_ids:
+            continue
+        if protected_id in curr_ids:
+            continue
+
+        previous_mask = prev_frame == protected_id
+        if not np.any(previous_mask):
+            continue
+
+        dilated_previous = binary_dilation(previous_mask, np.ones((3, 3), dtype=bool))
+        candidates = []
+        for newborn_id in newborn_ids:
+            if newborn_id in rescued_ids:
+                continue
+            current_mask = curr_frame == newborn_id
+            touch_pixels = int(np.count_nonzero(current_mask & dilated_previous))
+            if touch_pixels > 0:
+                candidates.append((touch_pixels, newborn_id))
+
+        if len(candidates) != 1:
+            continue
+
+        _, rescued_id = candidates[0]
+        for time_idx in range(frame_idx, int(normalized_tensor.shape[2])):
+            frame_t = normalized_tensor[:, :, time_idx]
+            rescue_pixels = frame_t == rescued_id
+            if np.any(rescue_pixels):
+                frame_t[rescue_pixels] = protected_id
+
+        rescued_ids.add(rescued_id)
+        curr_ids.discard(rescued_id)
+        curr_ids.add(protected_id)
+
+    return sorted(track_id for track_id in newborn_ids if track_id not in rescued_ids)
+
+
 # ---------------------------------------------------------------------------
 # Identity-continuity rescue  (general, multi-signal, confidence-based)
 # ---------------------------------------------------------------------------
@@ -793,7 +837,7 @@ def _log_rescue_summary(audit_log: list, label: str = "identity-continuity rescu
 def _normalize_ctc_divisions(
     final_tracked_tensor: np.ndarray,
     division_cooldown_frames: int = 20,
-    identity_rescue_gap: int = 1,
+    identity_rescue_gap: int = 0,
     rescue_confidence_threshold: float = 0.30,
     max_centroid_dist_px: float = 50.0,
 ):
@@ -814,11 +858,9 @@ def _normalize_ctc_divisions(
     cooldown_until: dict[int, int] = {}
 
     # -----------------------------------------------------------------------
-    # Stage 1 (optional): General identity-continuity rescue BEFORE division
-    # normalisation.  This handles label swaps unrelated to cell divisions as
-    # well as post-division swaps that the cooldown mechanism would miss.
-    # It runs first so that the division detection in Stage 2 sees a cleaner
-    # label field.
+    # Stage 1 (optional, non-standalone behavior): General identity-continuity
+    # rescue before division normalisation. Disabled by default so this runner
+    # matches run_tiptracking_standalone.py logic unless explicitly requested.
     # -----------------------------------------------------------------------
     if identity_rescue_gap > 0:
         print("[TRACKING] export: running identity-continuity rescue (pre-division pass)", flush=True)
@@ -836,8 +878,9 @@ def _normalize_ctc_divisions(
         _log_rescue_summary(pre_audit, label="pre-division identity rescue")
 
     # -----------------------------------------------------------------------
-    # Stage 2: CTC-style division normalisation (unchanged logic).
-    # The cooldown map built here is passed to the post-division rescue pass.
+    # Stage 2: CTC-style division normalisation. This mirrors
+    # run_tiptracking_standalone.py, including the narrow cooldown label-swap
+    # rescue for recently created daughters.
     # -----------------------------------------------------------------------
     for frame_idx in range(1, frame_count):
         prev_frame = normalized_tensor[:, :, frame_idx - 1]
@@ -854,6 +897,18 @@ def _normalize_ctc_divisions(
             if division_cooldown_frames > 0
             else set()
         )
+        if protected_track_ids and newborn_ids:
+            newborn_ids = _rescue_cooldown_label_swaps(
+                normalized_tensor=normalized_tensor,
+                frame_idx=frame_idx,
+                newborn_ids=newborn_ids,
+                protected_track_ids=protected_track_ids,
+            )
+            prev_frame = normalized_tensor[:, :, frame_idx - 1]
+            curr_frame = normalized_tensor[:, :, frame_idx]
+            prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+            curr_ids = _track_ids_in_frame(curr_frame).tolist()
+            newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
 
         mother_to_children = {}
         newborn_id_set = set(newborn_ids)
@@ -1210,14 +1265,17 @@ def _write_challenge_outputs(
     final_tracked_tensor: np.ndarray,
     output_digits: int,
     division_cooldown_frames: int,
-    identity_rescue_gap: int = 1,
+    identity_rescue_gap: int = 0,
     rescue_confidence_threshold: float = 0.30,
     max_centroid_dist_px: float = 50.0,
     tiff_write_workers: int = 4,
 ):
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[TRACKING] export: normalizing CTC divisions + identity rescue", flush=True)
+    if identity_rescue_gap > 0:
+        print("[TRACKING] export: normalizing CTC divisions + opt-in identity rescue", flush=True)
+    else:
+        print("[TRACKING] export: normalizing CTC divisions", flush=True)
     normalized_tensor, division_parent_map = _normalize_ctc_divisions(
         final_tracked_tensor,
         division_cooldown_frames=division_cooldown_frames,
@@ -1309,7 +1367,7 @@ def run_tracking(
     strict_matlab_id_matching: bool,
     output_digits: str,
     division_cooldown_frames: int,
-    identity_rescue_gap: int = 1,
+    identity_rescue_gap: int = 0,
     rescue_confidence_threshold: float = 0.30,
     max_centroid_dist_px: float = 50.0,
     io_workers: int = 1,
@@ -1807,11 +1865,12 @@ def parse_args():
     )
     parser.add_argument(
         "--identity-rescue-gap",
-        default=1,
+        default=0,
         type=int,
         help=(
             "Maximum frame gap over which the identity-continuity rescue will search for a "
-            "replacement label for a disappearing track (default: 1; 0 disables rescue)."
+            "replacement label for a disappearing track (default: 0 to match "
+            "run_tiptracking_standalone.py; set >0 to opt in)."
         ),
     )
     parser.add_argument(
