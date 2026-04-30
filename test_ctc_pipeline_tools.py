@@ -578,6 +578,35 @@ class CTCPipelineToolTests(unittest.TestCase):
                 "1 0 2 0\n",
             )
 
+    def test_temporal_downsample_can_resize_outputs_to_target_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "01_interp_RES"
+            output_dir = root / "eval" / "01_RES"
+            input_dir.mkdir()
+
+            for frame_idx in [0, 16, 32]:
+                mask = np.zeros((8, 8), dtype=np.uint16)
+                mask[2:6, 2:6] = 7
+                tifffile.imwrite(input_dir / f"mask{frame_idx:03d}.tif", mask)
+            (input_dir / "res_track.txt").write_text("7 0 32 0\n", encoding="utf-8")
+
+            temporal_downsample_ctc_results(
+                input_result_dir=input_dir,
+                output_result_dir=output_dir,
+                source_root=None,
+                sequence="01",
+                source_frame_count=3,
+                target_shape=(4, 4),
+                factor=16,
+                offset=0,
+            )
+
+            resized = tifffile.imread(output_dir / "mask000.tif")
+            self.assertEqual(resized.shape, (4, 4))
+            self.assertEqual(resized.dtype, np.uint16)
+            self.assertEqual(set(np.unique(resized).tolist()), {0, 1})
+
     def test_temporal_downsample_preserves_valid_parent_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

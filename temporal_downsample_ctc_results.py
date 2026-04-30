@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
+from skimage.transform import resize
 
 
 IMAGE_SUFFIXES = {".tif", ".tiff"}
@@ -149,6 +150,55 @@ def _read_mask(path: Path):
     return mask
 
 
+def _spatial_shape(array: np.ndarray):
+    arr = np.asarray(array)
+    if arr.ndim == 2:
+        return arr.shape
+    if arr.ndim == 3 and arr.shape[-1] in {3, 4}:
+        return arr.shape[:2]
+    return arr.shape
+
+
+def _target_shape_from_gt(source_root: Path, sequence: str):
+    sequence = _normalize_sequence(sequence)
+    candidates = [
+        (source_root / f"{sequence}_GT" / "TRA", "man_track"),
+        (source_root / f"{sequence}_GT" / "SEG", "man_seg"),
+    ]
+
+    for folder, prefix in candidates:
+        indexed, _ = _indexed_files(folder, prefix)
+        if indexed:
+            first = indexed[sorted(indexed)[0]]
+            return _spatial_shape(_read_mask(first))
+
+    raise FileNotFoundError(
+        f"Could not infer target shape from {source_root / f'{sequence}_GT' / 'TRA'} "
+        f"or {source_root / f'{sequence}_GT' / 'SEG'}."
+    )
+
+
+def _resize_label_mask_to_shape(mask: np.ndarray, target_shape: tuple[int, int]):
+    mask_shape = _spatial_shape(mask)
+    if mask_shape == target_shape:
+        return mask.astype(np.uint16, copy=False)
+    if len(mask_shape) != 2 or len(target_shape) != 2:
+        raise ValueError(f"Can only resize 2D masks, got {mask_shape} -> {target_shape}.")
+
+    resized = resize(
+        mask,
+        output_shape=target_shape,
+        order=0,
+        mode="edge",
+        anti_aliasing=False,
+        preserve_range=True,
+    )
+    resized = np.rint(resized)
+    if resized.size and int(resized.max()) > MAX_UINT16:
+        raise ValueError("Resized mask contains labels above uint16 capacity.")
+    return resized.astype(np.uint16, copy=False)
+
+
 def _parse_input_tracks(path: Path):
     rows: dict[int, InputTrackRow] = {}
     if not path.is_file():
@@ -281,6 +331,7 @@ def temporal_downsample_ctc_results(
     source_root: Path | None,
     sequence: str,
     source_frame_count: int | None = None,
+    target_shape: tuple[int, int] | None = None,
     factor: int = 16,
     offset: int = 0,
     output_digits: str = "auto",
@@ -310,6 +361,11 @@ def temporal_downsample_ctc_results(
     else:
         expected_frame_count = source_frame_count
         source_digits = None
+    if target_shape is None and source_root is not None:
+        try:
+            target_shape = _target_shape_from_gt(source_root, sequence)
+        except FileNotFoundError:
+            target_shape = None
     resolved_output_digits = _resolve_output_digits(output_digits, expected_frame_count, source_digits)
 
     input_masks, _ = _indexed_files(input_result_dir, "mask")
@@ -335,6 +391,8 @@ def temporal_downsample_ctc_results(
     for output_frame_idx, input_mask_path in enumerate(selected_mask_files):
         mask = _read_mask(input_mask_path)
         relabeled = _relabel_mask(mask, frame_label_maps[output_frame_idx])
+        if target_shape is not None:
+            relabeled = _resize_label_mask_to_shape(relabeled, target_shape)
         tifffile.imwrite(
             str(output_result_dir / f"mask{output_frame_idx:0{resolved_output_digits}d}.tif"),
             relabeled,
@@ -356,6 +414,7 @@ def temporal_downsample_ctc_results(
         "selected_first": selected_input_indices[0] if selected_input_indices else None,
         "selected_last": selected_input_indices[-1] if selected_input_indices else None,
         "shape": reference_shape,
+        "target_shape": target_shape,
     }
 
 
@@ -380,6 +439,14 @@ def parse_args():
         type=int,
         help="Original timeline frame count. Use this to avoid staging/copying raw source images.",
     )
+    parser.add_argument(
+        "--target-shape",
+        default=None,
+        help=(
+            "Optional output mask shape as HEIGHT,WIDTH. If omitted and --source-root has GT, "
+            "the first GT mask shape is used."
+        ),
+    )
     parser.add_argument("--sequence", required=True, type=str, help="Sequence ID, e.g. 01 or 02.")
     parser.add_argument("--factor", default=16, type=int, help="Temporal downsample factor (default: 16).")
     parser.add_argument("--offset", default=0, type=int, help="First interpolated frame to keep (default: 0).")
@@ -400,6 +467,11 @@ def main():
             source_root=args.source_root,
             sequence=args.sequence,
             source_frame_count=args.source_frame_count,
+            target_shape=(
+                None
+                if args.target_shape is None
+                else tuple(_parse_positive_int(part, "--target-shape") for part in args.target_shape.split(","))
+            ),
             factor=args.factor,
             offset=args.offset,
             output_digits=args.output_digits,
