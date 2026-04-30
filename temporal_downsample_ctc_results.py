@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import tifffile
+
+
+IMAGE_SUFFIXES = {".tif", ".tiff"}
+MAX_UINT16 = int(np.iinfo(np.uint16).max)
+
+
+@dataclass(frozen=True)
+class InputTrackRow:
+    label: int
+    begin: int
+    end: int
+    parent: int
+
+
+@dataclass(frozen=True)
+class OutputTrackRow:
+    old_label: int
+    label: int
+    begin: int
+    end: int
+    parent: int
+
+
+def _natural_sort_key(text: str):
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def _normalize_sequence(sequence: str) -> str:
+    text = str(sequence)
+    if text.isdigit():
+        return f"{int(text):02d}"
+    return text
+
+
+def _minimum_digit_width(frame_count: int) -> int:
+    highest_index = max(frame_count - 1, 0)
+    return max(3, len(str(highest_index)))
+
+
+def _parse_positive_int(value: str, option_name: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{option_name} must be a positive integer.") from exc
+    if parsed < 1:
+        raise ValueError(f"{option_name} must be a positive integer.")
+    return parsed
+
+
+def _resolve_output_digits(output_digits: str, frame_count: int, source_digits: int | None) -> int:
+    required = _minimum_digit_width(frame_count)
+    if output_digits == "auto":
+        digits = max(required, source_digits or 0)
+    else:
+        digits = _parse_positive_int(output_digits, "--output-digits")
+
+    if frame_count > 10**digits:
+        raise ValueError(
+            f"Cannot export {frame_count} frames with {digits} digits. "
+            f"Use --output-digits {required} or higher."
+        )
+    return digits
+
+
+def _indexed_files(folder: Path, prefix: str):
+    regex = re.compile(rf"^{re.escape(prefix)}(\d+)\.tiff?$", flags=re.IGNORECASE)
+    indexed: dict[int, Path] = {}
+    digit_widths = set()
+    bad_names = []
+
+    if not folder.is_dir():
+        return indexed, digit_widths
+
+    for path in sorted(folder.iterdir(), key=lambda p: _natural_sort_key(p.name)):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        if not path.name.lower().startswith(prefix.lower()):
+            continue
+        match = regex.match(path.name)
+        if match is None:
+            bad_names.append(path.name)
+            continue
+        index = int(match.group(1))
+        if index in indexed:
+            raise ValueError(f"Duplicate {prefix} file for frame {index}: {indexed[index]} and {path}")
+        indexed[index] = path
+        digit_widths.add(len(match.group(1)))
+
+    if bad_names:
+        preview = ", ".join(bad_names[:10])
+        raise ValueError(f"{folder} contains malformed {prefix}*.tif files: {preview}")
+
+    return indexed, digit_widths
+
+
+def _require_contiguous_from_zero(indexed: dict[int, Path], label: str):
+    if not indexed:
+        raise ValueError(f"No {label} files found.")
+    observed = sorted(indexed)
+    expected = list(range(observed[-1] + 1))
+    if observed != expected:
+        missing = sorted(set(expected) - set(observed))
+        preview = ", ".join(str(idx) for idx in missing[:20])
+        raise ValueError(f"{label} files are not contiguous from frame 0. Missing indices: {preview}")
+
+
+def _source_frame_count_and_digits(source_root: Path, sequence: str):
+    sequence = _normalize_sequence(sequence)
+    candidates = [
+        (source_root / sequence, "t", True),
+        (source_root / f"{sequence}_GT" / "TRA", "man_track", False),
+        (source_root / f"{sequence}_GT" / "SEG", "man_seg", False),
+    ]
+
+    for folder, prefix, require_contiguous in candidates:
+        indexed, digit_widths = _indexed_files(folder, prefix)
+        if not indexed:
+            continue
+        if require_contiguous:
+            _require_contiguous_from_zero(indexed, f"{prefix} source")
+        source_digits = int(next(iter(digit_widths))) if len(digit_widths) == 1 else None
+        return max(indexed) + 1, source_digits
+
+    raise FileNotFoundError(
+        f"Could not infer frame count from {source_root / sequence}, "
+        f"{source_root / f'{sequence}_GT' / 'TRA'}, or {source_root / f'{sequence}_GT' / 'SEG'}."
+    )
+
+
+def _read_mask(path: Path):
+    try:
+        mask = np.asarray(tifffile.imread(str(path)))
+    except Exception as exc:
+        raise ValueError(f"Could not read mask {path}: {exc}") from exc
+    if not np.issubdtype(mask.dtype, np.integer):
+        raise ValueError(f"{path} has non-integer dtype {mask.dtype}.")
+    if mask.size and int(mask.min()) < 0:
+        raise ValueError(f"{path} contains negative labels.")
+    return mask
+
+
+def _parse_input_tracks(path: Path):
+    rows: dict[int, InputTrackRow] = {}
+    if not path.is_file():
+        return rows
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 4:
+                raise ValueError(f"{path}:{line_number} must contain four integer columns: L B E P")
+            try:
+                label, begin, end, parent = [int(part) for part in parts]
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_number} contains a non-integer value.") from exc
+            rows[label] = InputTrackRow(label=label, begin=begin, end=end, parent=parent)
+    return rows
+
+
+def _contiguous_runs(frames: list[int]):
+    if not frames:
+        return []
+    frames = sorted(frames)
+    runs = []
+    start = previous = frames[0]
+    for frame_idx in frames[1:]:
+        if frame_idx == previous + 1:
+            previous = frame_idx
+            continue
+        runs.append((start, previous))
+        start = previous = frame_idx
+    runs.append((start, previous))
+    return runs
+
+
+def _scan_sampled_label_frames(selected_mask_files: list[Path]):
+    label_frames: dict[int, list[int]] = {}
+    reference_shape = None
+
+    for output_frame_idx, mask_path in enumerate(selected_mask_files):
+        mask = _read_mask(mask_path)
+        mask_shape = tuple(mask.shape)
+        if reference_shape is None:
+            reference_shape = mask_shape
+        elif mask_shape != reference_shape:
+            raise ValueError(f"{mask_path} shape {mask_shape} differs from first mask shape {reference_shape}.")
+
+        labels = np.unique(mask)
+        labels = labels[labels != 0].astype(int, copy=False)
+        for label in labels.tolist():
+            label_frames.setdefault(label, []).append(output_frame_idx)
+
+    return label_frames, reference_shape
+
+
+def _build_output_tracks(
+    label_frames: dict[int, list[int]],
+    input_rows: dict[int, InputTrackRow],
+):
+    rows_without_parents: list[tuple[int, int, int, int]] = []
+    tracks_by_old_label: dict[int, list[tuple[int, int, int, int]]] = {}
+
+    for old_label in sorted(label_frames):
+        for begin, end in _contiguous_runs(label_frames[old_label]):
+            new_label = len(rows_without_parents) + 1
+            if new_label > MAX_UINT16:
+                raise ValueError("Downsampled track count exceeds uint16 capacity.")
+            row = (old_label, new_label, begin, end)
+            rows_without_parents.append(row)
+            tracks_by_old_label.setdefault(old_label, []).append(row)
+
+    output_rows: list[OutputTrackRow] = []
+    for old_label, new_label, begin, end in rows_without_parents:
+        input_row = input_rows.get(old_label)
+        parent = 0
+        if input_row is not None and input_row.parent != 0 and begin > 0:
+            parent_candidates = [
+                candidate
+                for candidate in tracks_by_old_label.get(input_row.parent, [])
+                if candidate[3] < begin
+            ]
+            if parent_candidates:
+                parent = max(parent_candidates, key=lambda candidate: (candidate[3], candidate[1]))[1]
+                if parent == new_label:
+                    parent = 0
+
+        output_rows.append(
+            OutputTrackRow(
+                old_label=old_label,
+                label=new_label,
+                begin=begin,
+                end=end,
+                parent=parent,
+            )
+        )
+
+    return output_rows
+
+
+def _build_frame_label_maps(output_rows: list[OutputTrackRow], frame_count: int):
+    frame_maps: list[dict[int, int]] = [{} for _ in range(frame_count)]
+    for row in output_rows:
+        for frame_idx in range(row.begin, row.end + 1):
+            frame_maps[frame_idx][row.old_label] = row.label
+    return frame_maps
+
+
+def _clear_ctc_outputs(output_result_dir: Path):
+    output_result_dir.mkdir(parents=True, exist_ok=True)
+    for path in output_result_dir.iterdir():
+        if path.is_file() and path.name.lower().startswith("mask") and path.suffix.lower() in IMAGE_SUFFIXES:
+            path.unlink()
+    track_file = output_result_dir / "res_track.txt"
+    if track_file.exists():
+        track_file.unlink()
+
+
+def _relabel_mask(mask: np.ndarray, label_map: dict[int, int]):
+    relabeled = np.zeros(mask.shape, dtype=np.uint16)
+    for old_label, new_label in label_map.items():
+        relabeled[mask == old_label] = new_label
+    return relabeled
+
+
+def temporal_downsample_ctc_results(
+    input_result_dir: Path,
+    output_result_dir: Path,
+    source_root: Path,
+    sequence: str,
+    factor: int = 16,
+    offset: int = 0,
+    output_digits: str = "auto",
+):
+    input_result_dir = input_result_dir.resolve()
+    output_result_dir = output_result_dir.resolve()
+    source_root = source_root.resolve()
+    sequence = _normalize_sequence(sequence)
+
+    if factor < 1:
+        raise ValueError("--factor must be >= 1.")
+    if offset < 0:
+        raise ValueError("--offset must be >= 0.")
+    if input_result_dir == output_result_dir:
+        raise ValueError("input-result-dir and output-result-dir must be different directories.")
+    if not input_result_dir.is_dir():
+        raise NotADirectoryError(f"input-result-dir does not exist: {input_result_dir}")
+    if not source_root.is_dir():
+        raise NotADirectoryError(f"source-root does not exist: {source_root}")
+
+    expected_frame_count, source_digits = _source_frame_count_and_digits(source_root, sequence)
+    resolved_output_digits = _resolve_output_digits(output_digits, expected_frame_count, source_digits)
+
+    input_masks, _ = _indexed_files(input_result_dir, "mask")
+    if not input_masks:
+        raise FileNotFoundError(f"No mask*.tif files found in {input_result_dir}.")
+
+    selected_input_indices = [offset + output_idx * factor for output_idx in range(expected_frame_count)]
+    missing = [index for index in selected_input_indices if index not in input_masks]
+    if missing:
+        preview = ", ".join(str(index) for index in missing[:20])
+        raise ValueError(
+            f"Input result does not contain all selected frames for factor={factor}, offset={offset}. "
+            f"Missing input mask indices: {preview}"
+        )
+    selected_mask_files = [input_masks[index] for index in selected_input_indices]
+
+    label_frames, reference_shape = _scan_sampled_label_frames(selected_mask_files)
+    input_rows = _parse_input_tracks(input_result_dir / "res_track.txt")
+    output_rows = _build_output_tracks(label_frames, input_rows)
+    frame_label_maps = _build_frame_label_maps(output_rows, expected_frame_count)
+
+    _clear_ctc_outputs(output_result_dir)
+    for output_frame_idx, input_mask_path in enumerate(selected_mask_files):
+        mask = _read_mask(input_mask_path)
+        relabeled = _relabel_mask(mask, frame_label_maps[output_frame_idx])
+        tifffile.imwrite(
+            str(output_result_dir / f"mask{output_frame_idx:0{resolved_output_digits}d}.tif"),
+            relabeled,
+        )
+
+    with (output_result_dir / "res_track.txt").open("w", encoding="utf-8") as handle:
+        for row in output_rows:
+            handle.write(f"{row.label} {row.begin} {row.end} {row.parent}\n")
+
+    return {
+        "sequence": sequence,
+        "frames": expected_frame_count,
+        "tracks": len(output_rows),
+        "digits": resolved_output_digits,
+        "factor": factor,
+        "offset": offset,
+        "input_result_dir": input_result_dir,
+        "output_result_dir": output_result_dir,
+        "selected_first": selected_input_indices[0] if selected_input_indices else None,
+        "selected_last": selected_input_indices[-1] if selected_input_indices else None,
+        "shape": reference_shape,
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Temporally downsample interpolated CTC tracking results back to the original "
+            "source timeline, rebuilding mask names and res_track.txt."
+        )
+    )
+    parser.add_argument("--input-result-dir", required=True, type=Path, help="Folder containing interpolated mask*.tif files.")
+    parser.add_argument("--output-result-dir", required=True, type=Path, help="Destination CTC result folder.")
+    parser.add_argument("--source-root", required=True, type=Path, help="Original CTC dataset root.")
+    parser.add_argument("--sequence", required=True, type=str, help="Sequence ID, e.g. 01 or 02.")
+    parser.add_argument("--factor", default=16, type=int, help="Temporal downsample factor (default: 16).")
+    parser.add_argument("--offset", default=0, type=int, help="First interpolated frame to keep (default: 0).")
+    parser.add_argument(
+        "--output-digits",
+        default="auto",
+        help="Digits used for output mask names: auto or a positive integer (default: auto).",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    try:
+        report = temporal_downsample_ctc_results(
+            input_result_dir=args.input_result_dir,
+            output_result_dir=args.output_result_dir,
+            source_root=args.source_root,
+            sequence=args.sequence,
+            factor=args.factor,
+            offset=args.offset,
+            output_digits=args.output_digits,
+        )
+    except Exception as exc:
+        print(f"[TEMPORAL DOWNSAMPLE] FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        "[TEMPORAL DOWNSAMPLE] OK "
+        f"sequence={report['sequence']} factor={report['factor']} offset={report['offset']} "
+        f"frames={report['frames']} tracks={report['tracks']} digits={report['digits']} "
+        f"selected={report['selected_first']}..{report['selected_last']} "
+        f"output={report['output_result_dir']}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

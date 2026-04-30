@@ -4,12 +4,14 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import tifffile
 
 from analyze_tracking_failures import analyze_failures
 from evaluate_ctc_results import summarize_official_logs
+from run_ctc_training_pipeline import _run_sequence, _tracking_position_for_sequence
 from run_tiptracking_standalone import (
     _compact_labels_in_place,
     _normalize_ctc_divisions,
@@ -24,6 +26,7 @@ from ram_run_tiptracking_standalone_optimized import (
     _split_discontinuous_tracks as _split_discontinuous_tracks_ram,
 )
 from rescale_image_mask_pairs import rescale_dataset, resize_mask_array
+from temporal_downsample_ctc_results import temporal_downsample_ctc_results
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
 from visualize_rescale_overlay import export_rescale_overlay_comparisons
 from view_tracking_overlay import (
@@ -448,6 +451,183 @@ class CTCPipelineToolTests(unittest.TestCase):
                     sequence="01",
                     digits_arg="3",
                 )
+
+    def _write_source_frames(self, source_root: Path, sequence: str, frame_count: int, shape=(6, 6)):
+        image_dir = source_root / sequence
+        image_dir.mkdir(parents=True)
+        for frame_idx in range(frame_count):
+            tifffile.imwrite(image_dir / f"t{frame_idx:03d}.tif", np.zeros(shape, dtype=np.uint16))
+
+    def test_temporal_downsample_selects_every_16th_frame_and_rebuilds_tracks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            input_dir = root / "01_interp_RES"
+            output_dir = root / "eval" / "01_RES"
+            self._write_source_frames(source, "01", frame_count=3)
+            input_dir.mkdir()
+
+            for frame_idx in range(33):
+                mask = np.zeros((6, 6), dtype=np.uint16)
+                if frame_idx in {0, 16, 32}:
+                    mask[1:3, 1:3] = 7
+                if frame_idx in {16, 32}:
+                    mask[3:5, 3:5] = 13
+                tifffile.imwrite(input_dir / f"mask{frame_idx:03d}.tif", mask)
+            (input_dir / "res_track.txt").write_text("7 0 32 0\n13 16 32 7\n", encoding="utf-8")
+
+            report = temporal_downsample_ctc_results(
+                input_result_dir=input_dir,
+                output_result_dir=output_dir,
+                source_root=source,
+                sequence="01",
+                factor=16,
+                offset=0,
+            )
+
+            self.assertEqual(report["frames"], 3)
+            self.assertEqual(report["tracks"], 2)
+            self.assertEqual([path.name for path in sorted(output_dir.glob("mask*.tif"))], [
+                "mask000.tif",
+                "mask001.tif",
+                "mask002.tif",
+            ])
+            self.assertEqual(
+                (output_dir / "res_track.txt").read_text(encoding="utf-8"),
+                "1 0 2 0\n2 1 2 0\n",
+            )
+            np.testing.assert_array_equal(tifffile.imread(output_dir / "mask000.tif")[1:3, 1:3], np.full((2, 2), 1))
+            np.testing.assert_array_equal(tifffile.imread(output_dir / "mask001.tif")[3:5, 3:5], np.full((2, 2), 2))
+
+            validation = validate_ctc_result_format(
+                dataset_root=output_dir.parent,
+                source_root=source,
+                sequence="01",
+                digits_arg="auto",
+            )
+            self.assertEqual(validation["frames"], 3)
+            self.assertEqual(validation["tracks"], 2)
+
+    def test_temporal_downsample_splits_discontinuous_sampled_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            input_dir = root / "01_interp_RES"
+            output_dir = root / "eval" / "01_RES"
+            self._write_source_frames(source, "01", frame_count=3)
+            input_dir.mkdir()
+
+            for frame_idx in [0, 16, 32]:
+                mask = np.zeros((6, 6), dtype=np.uint16)
+                if frame_idx in {0, 32}:
+                    mask[1:3, 1:3] = 7
+                tifffile.imwrite(input_dir / f"mask{frame_idx:03d}.tif", mask)
+            (input_dir / "res_track.txt").write_text("7 0 32 0\n", encoding="utf-8")
+
+            temporal_downsample_ctc_results(
+                input_result_dir=input_dir,
+                output_result_dir=output_dir,
+                source_root=source,
+                sequence="01",
+                factor=16,
+                offset=0,
+            )
+
+            self.assertEqual(
+                (output_dir / "res_track.txt").read_text(encoding="utf-8"),
+                "1 0 0 0\n2 2 2 0\n",
+            )
+            self.assertEqual(set(np.unique(tifffile.imread(output_dir / "mask000.tif")).tolist()), {0, 1})
+            self.assertEqual(set(np.unique(tifffile.imread(output_dir / "mask001.tif")).tolist()), {0})
+            self.assertEqual(set(np.unique(tifffile.imread(output_dir / "mask002.tif")).tolist()), {0, 2})
+
+            validation = validate_ctc_result_format(
+                dataset_root=output_dir.parent,
+                source_root=source,
+                sequence="01",
+                digits_arg="auto",
+            )
+            self.assertEqual(validation["tracks"], 2)
+
+    def test_temporal_downsample_preserves_valid_parent_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            input_dir = root / "01_interp_RES"
+            output_dir = root / "eval" / "01_RES"
+            self._write_source_frames(source, "01", frame_count=3)
+            input_dir.mkdir()
+
+            for frame_idx in [0, 16, 32]:
+                mask = np.zeros((6, 6), dtype=np.uint16)
+                if frame_idx == 0:
+                    mask[1:3, 1:3] = 1
+                if frame_idx in {16, 32}:
+                    mask[3:5, 3:5] = 2
+                tifffile.imwrite(input_dir / f"mask{frame_idx:03d}.tif", mask)
+            (input_dir / "res_track.txt").write_text("1 0 15 0\n2 16 32 1\n", encoding="utf-8")
+
+            temporal_downsample_ctc_results(
+                input_result_dir=input_dir,
+                output_result_dir=output_dir,
+                source_root=source,
+                sequence="01",
+                factor=16,
+                offset=0,
+            )
+
+            self.assertEqual(
+                (output_dir / "res_track.txt").read_text(encoding="utf-8"),
+                "1 0 0 0\n2 1 2 1\n",
+            )
+            validate_ctc_result_format(
+                dataset_root=output_dir.parent,
+                source_root=source,
+                sequence="01",
+                digits_arg="auto",
+            )
+
+    def test_pipeline_temporal_downsample_dry_run_uses_intermediate_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            eval_root = root / "eval"
+            log_dir = root / "logs"
+            source.mkdir()
+
+            args = SimpleNamespace(
+                python="python",
+                source_root=source,
+                eval_root=eval_root,
+                log_dir=log_dir,
+                stage_gt="none",
+                dry_run=True,
+                skip_tracking=False,
+                skip_validation=True,
+                skip_evaluation=True,
+                skip_failure_analysis=True,
+                ctc_software_dir=None,
+                mask_dir_template=None,
+                mask_pattern="mask*.tif",
+                time_series_threshold=1,
+                output_digits="auto",
+                digits="auto",
+                temporal_downsample_factor=16,
+                temporal_downsample_offset=0,
+                strict_matlab_id_matching=True,
+                metrics=["TRA", "SEG", "DET"],
+                det_penalize_extra_detections=None,
+            )
+
+            self.assertEqual(_tracking_position_for_sequence("01", 16), "01_interp")
+            _run_sequence(args, Path(__file__).resolve().parent, "01")
+
+            tracking_log = (log_dir / "01_tracking.log").read_text(encoding="utf-8")
+            downsample_log = (log_dir / "01_temporal_downsample.log").read_text(encoding="utf-8")
+            self.assertIn("--position 01_interp", tracking_log)
+            self.assertIn("temporal_downsample_ctc_results.py", downsample_log)
+            self.assertIn(str(eval_root / "01_interp_RES"), downsample_log)
+            self.assertIn(str(eval_root / "01_RES"), downsample_log)
 
     def test_official_log_parser_writes_penalty_and_seg_reports(self):
         with tempfile.TemporaryDirectory() as tmp:

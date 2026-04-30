@@ -1,0 +1,10 @@
+command:
+EvaluationSoftware/Mac/TRAMeasure /Users/vatsaldp/Documents/cell tracking challenge/EvaluationSoftware/testing_dataset 03 3
+
+returncode: 0
+
+stdout:
+TRA measure: 0.622980
+
+
+stderr:

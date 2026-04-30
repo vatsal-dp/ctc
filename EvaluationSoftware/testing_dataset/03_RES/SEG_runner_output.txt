@@ -1,0 +1,10 @@
+command:
+EvaluationSoftware/Mac/SEGMeasure /Users/vatsaldp/Documents/cell tracking challenge/EvaluationSoftware/testing_dataset 03 3
+
+returncode: 255
+
+stdout:
+The directory '/Users/vatsaldp/Documents/cell tracking challenge/EvaluationSoftware/testing_dataset/03_GT/SEG/' does not exist!
+
+
+stderr:

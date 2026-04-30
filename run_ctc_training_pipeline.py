@@ -88,12 +88,20 @@ def _mask_dir_for_sequence(source_root: Path, sequence: str, mask_dir_template: 
     return source_root / f"{sequence}_ERR_SEG"
 
 
+def _tracking_position_for_sequence(sequence: str, temporal_downsample_factor: int):
+    if temporal_downsample_factor > 1:
+        return f"{sequence}_interp"
+    return sequence
+
+
 def _run_sequence(args, script_dir: Path, sequence: str):
     python_exe = Path(args.python).expanduser()
     source_root = args.source_root.resolve()
     eval_root = args.eval_root.resolve()
     log_dir = args.log_dir.resolve() if args.log_dir is not None else eval_root / "pipeline_logs"
     result_dir = eval_root / f"{sequence}_RES"
+    tracking_position = _tracking_position_for_sequence(sequence, args.temporal_downsample_factor)
+    tracking_result_dir = eval_root / f"{tracking_position}_RES"
 
     if args.stage_gt != "none":
         gt_src = source_root / f"{sequence}_GT"
@@ -125,7 +133,7 @@ def _run_sequence(args, script_dir: Path, sequence: str):
             "--output-dir",
             str(eval_root),
             "--position",
-            sequence,
+            tracking_position,
             "--time-series-threshold",
             str(args.time_series_threshold),
             "--output-digits",
@@ -134,6 +142,27 @@ def _run_sequence(args, script_dir: Path, sequence: str):
         if not args.strict_matlab_id_matching:
             command.append("--no-strict-matlab-id-matching")
         _run_command(command, log_dir / f"{sequence}_tracking.log", args.dry_run)
+
+        if args.temporal_downsample_factor > 1:
+            command = [
+                str(python_exe),
+                str(_script_path(script_dir, "temporal_downsample_ctc_results.py")),
+                "--input-result-dir",
+                str(tracking_result_dir),
+                "--output-result-dir",
+                str(result_dir),
+                "--source-root",
+                str(source_root),
+                "--sequence",
+                sequence,
+                "--factor",
+                str(args.temporal_downsample_factor),
+                "--offset",
+                str(args.temporal_downsample_offset),
+                "--output-digits",
+                args.digits,
+            ]
+            _run_command(command, log_dir / f"{sequence}_temporal_downsample.log", args.dry_run)
 
     if not args.skip_validation:
         command = [
@@ -229,6 +258,18 @@ def parse_args():
     parser.add_argument("--time-series-threshold", default=1, type=int)
     parser.add_argument("--output-digits", default="auto", help="Tracking export width: auto or a positive integer.")
     parser.add_argument("--digits", default="auto", help="CTC evaluation digit width: auto or a positive integer.")
+    parser.add_argument(
+        "--temporal-downsample-factor",
+        default=1,
+        type=int,
+        help="Keep every Nth tracked frame before validation/evaluation (default: 1, disabled).",
+    )
+    parser.add_argument(
+        "--temporal-downsample-offset",
+        default=0,
+        type=int,
+        help="First interpolated frame to keep when temporal downsampling is enabled (default: 0).",
+    )
     parser.add_argument("--metrics", nargs="+", choices=METRICS, default=list(METRICS))
     parser.add_argument(
         "--det-penalize-extra-detections",
@@ -272,6 +313,10 @@ def main():
         args.ctc_software_dir = args.ctc_software_dir.resolve()
         if not args.ctc_software_dir.is_dir():
             raise SystemExit(f"ctc-software-dir does not exist or is not a directory: {args.ctc_software_dir}")
+    if args.temporal_downsample_factor < 1:
+        raise SystemExit("--temporal-downsample-factor must be >= 1")
+    if args.temporal_downsample_offset < 0:
+        raise SystemExit("--temporal-downsample-offset must be >= 0")
 
     if not args.dry_run:
         args.eval_root.mkdir(parents=True, exist_ok=True)
