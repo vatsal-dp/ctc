@@ -220,11 +220,52 @@ def _read_input(input_path: Path, pattern: str, time_axis: str, inspect_only: bo
     raise ValueError(f"Unsupported input type: {input_path}. Use a mask folder or .pkl file.")
 
 
-def _transform_frames(frames: list[np.ndarray], transpose_spatial: bool):
+def _resize_nearest_label_mask(frame: np.ndarray, output_shape: tuple[int, int]):
+    out_height, out_width = output_shape
+    if out_height <= 0 or out_width <= 0:
+        raise ValueError("--resize-spatial dimensions must be positive integers.")
+
+    in_height, in_width = frame.shape
+    if (in_height, in_width) == (out_height, out_width):
+        return frame
+
+    row_coords = (np.arange(out_height) + 0.5) * (in_height / out_height) - 0.5
+    col_coords = (np.arange(out_width) + 0.5) * (in_width / out_width) - 0.5
+    row_idx = np.clip(np.rint(row_coords).astype(np.int64), 0, in_height - 1)
+    col_idx = np.clip(np.rint(col_coords).astype(np.int64), 0, in_width - 1)
+    return np.ascontiguousarray(frame[row_idx[:, None], col_idx[None, :]])
+
+
+def _transform_frames(
+    frames: list[np.ndarray],
+    transpose_spatial: bool,
+    resize_spatial: tuple[int, int] | None,
+):
     if not transpose_spatial:
-        return frames
-    print("[EXPORT] transposing each mask frame from (Y, X) to (X, Y)", flush=True)
-    return [np.ascontiguousarray(frame.T) for frame in frames]
+        transformed = frames
+    else:
+        print("[EXPORT] transposing each mask frame from (Y, X) to (X, Y)", flush=True)
+        transformed = [np.ascontiguousarray(frame.T) for frame in frames]
+
+    if resize_spatial is None:
+        return transformed
+
+    print(
+        f"[EXPORT] resizing each mask frame to {resize_spatial[0]}x{resize_spatial[1]} with nearest neighbor",
+        flush=True,
+    )
+    return [_resize_nearest_label_mask(frame, resize_spatial) for frame in transformed]
+
+
+def _parse_resize_spatial(value: list[int] | None):
+    if value is None:
+        return None
+    if len(value) != 2:
+        raise ValueError("--resize-spatial expects HEIGHT WIDTH.")
+    height, width = value
+    if height <= 0 or width <= 0:
+        raise ValueError("--resize-spatial dimensions must be positive integers.")
+    return height, width
 
 
 def _contiguous_runs(frames: list[int]):
@@ -663,6 +704,14 @@ def parse_args():
         help="Transpose each output mask frame. Use when RES shape is the reverse of GT shape.",
     )
     parser.add_argument(
+        "--resize-spatial",
+        nargs=2,
+        metavar=("HEIGHT", "WIDTH"),
+        type=int,
+        default=None,
+        help="Resize each output mask frame with nearest neighbor, e.g. --resize-spatial 1010 1010.",
+    )
+    parser.add_argument(
         "--infer-divisions",
         action="store_true",
         help="Infer CTC parent IDs from adjacent-frame mask contact and relabel mother continuations as daughters.",
@@ -704,7 +753,11 @@ def main():
         )
         if args.inspect_only:
             return 0
-        frames = _transform_frames(frames, transpose_spatial=args.transpose_spatial)
+        frames = _transform_frames(
+            frames,
+            transpose_spatial=args.transpose_spatial,
+            resize_spatial=_parse_resize_spatial(args.resize_spatial),
+        )
         export_ctc_result(
             frames=frames,
             output_dir=args.output_result_dir,
