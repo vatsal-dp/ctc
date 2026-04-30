@@ -268,6 +268,32 @@ def _parse_resize_spatial(value: list[int] | None):
     return height, width
 
 
+def _pad_frames(frames: list[np.ndarray], pad_start: int, pad_end: int, pad_mode: str):
+    if pad_start < 0 or pad_end < 0:
+        raise ValueError("--pad-start and --pad-end must be >= 0.")
+    if not frames or (pad_start == 0 and pad_end == 0):
+        return frames
+
+    if pad_mode == "blank":
+        start_frame = np.zeros_like(frames[0])
+        end_frame = np.zeros_like(frames[-1])
+    elif pad_mode == "edge":
+        start_frame = frames[0]
+        end_frame = frames[-1]
+    else:
+        raise ValueError("--pad-mode must be 'blank' or 'edge'.")
+
+    print(
+        f"[EXPORT] padding frames: start={pad_start} end={pad_end} mode={pad_mode}",
+        flush=True,
+    )
+    return (
+        [start_frame.copy() for _ in range(pad_start)]
+        + frames
+        + [end_frame.copy() for _ in range(pad_end)]
+    )
+
+
 def _contiguous_runs(frames: list[int]):
     if not frames:
         return []
@@ -712,6 +738,24 @@ def parse_args():
         help="Resize each output mask frame with nearest neighbor, e.g. --resize-spatial 1010 1010.",
     )
     parser.add_argument(
+        "--pad-start",
+        default=0,
+        type=int,
+        help="Number of fake frames to prepend before writing mask files.",
+    )
+    parser.add_argument(
+        "--pad-end",
+        default=0,
+        type=int,
+        help="Number of fake frames to append before writing mask files.",
+    )
+    parser.add_argument(
+        "--pad-mode",
+        choices=["blank", "edge"],
+        default="edge",
+        help="Fake-frame content: duplicate first/last masks with edge, or write empty masks with blank.",
+    )
+    parser.add_argument(
         "--infer-divisions",
         action="store_true",
         help="Infer CTC parent IDs from adjacent-frame mask contact and relabel mother continuations as daughters.",
@@ -757,6 +801,12 @@ def main():
             frames,
             transpose_spatial=args.transpose_spatial,
             resize_spatial=_parse_resize_spatial(args.resize_spatial),
+        )
+        frames = _pad_frames(
+            frames,
+            pad_start=args.pad_start,
+            pad_end=args.pad_end,
+            pad_mode=args.pad_mode,
         )
         export_ctc_result(
             frames=frames,
