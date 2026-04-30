@@ -278,29 +278,38 @@ def _relabel_mask(mask: np.ndarray, label_map: dict[int, int]):
 def temporal_downsample_ctc_results(
     input_result_dir: Path,
     output_result_dir: Path,
-    source_root: Path,
+    source_root: Path | None,
     sequence: str,
+    source_frame_count: int | None = None,
     factor: int = 16,
     offset: int = 0,
     output_digits: str = "auto",
 ):
     input_result_dir = input_result_dir.resolve()
     output_result_dir = output_result_dir.resolve()
-    source_root = source_root.resolve()
+    source_root = source_root.resolve() if source_root is not None else None
     sequence = _normalize_sequence(sequence)
 
     if factor < 1:
         raise ValueError("--factor must be >= 1.")
     if offset < 0:
         raise ValueError("--offset must be >= 0.")
+    if source_frame_count is not None and source_frame_count < 1:
+        raise ValueError("--source-frame-count must be a positive integer.")
     if input_result_dir == output_result_dir:
         raise ValueError("input-result-dir and output-result-dir must be different directories.")
     if not input_result_dir.is_dir():
         raise NotADirectoryError(f"input-result-dir does not exist: {input_result_dir}")
-    if not source_root.is_dir():
+    if source_root is None and source_frame_count is None:
+        raise ValueError("Provide either --source-root or --source-frame-count.")
+    if source_root is not None and not source_root.is_dir():
         raise NotADirectoryError(f"source-root does not exist: {source_root}")
 
-    expected_frame_count, source_digits = _source_frame_count_and_digits(source_root, sequence)
+    if source_frame_count is None:
+        expected_frame_count, source_digits = _source_frame_count_and_digits(source_root, sequence)
+    else:
+        expected_frame_count = source_frame_count
+        source_digits = None
     resolved_output_digits = _resolve_output_digits(output_digits, expected_frame_count, source_digits)
 
     input_masks, _ = _indexed_files(input_result_dir, "mask")
@@ -359,7 +368,18 @@ def parse_args():
     )
     parser.add_argument("--input-result-dir", required=True, type=Path, help="Folder containing interpolated mask*.tif files.")
     parser.add_argument("--output-result-dir", required=True, type=Path, help="Destination CTC result folder.")
-    parser.add_argument("--source-root", required=True, type=Path, help="Original CTC dataset root.")
+    parser.add_argument(
+        "--source-root",
+        default=None,
+        type=Path,
+        help="Original CTC dataset root. Used to infer frame count unless --source-frame-count is provided.",
+    )
+    parser.add_argument(
+        "--source-frame-count",
+        default=None,
+        type=int,
+        help="Original timeline frame count. Use this to avoid staging/copying raw source images.",
+    )
     parser.add_argument("--sequence", required=True, type=str, help="Sequence ID, e.g. 01 or 02.")
     parser.add_argument("--factor", default=16, type=int, help="Temporal downsample factor (default: 16).")
     parser.add_argument("--offset", default=0, type=int, help="First interpolated frame to keep (default: 0).")
@@ -379,6 +399,7 @@ def main():
             output_result_dir=args.output_result_dir,
             source_root=args.source_root,
             sequence=args.sequence,
+            source_frame_count=args.source_frame_count,
             factor=args.factor,
             offset=args.offset,
             output_digits=args.output_digits,

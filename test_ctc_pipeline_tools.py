@@ -549,6 +549,35 @@ class CTCPipelineToolTests(unittest.TestCase):
             )
             self.assertEqual(validation["tracks"], 2)
 
+    def test_temporal_downsample_accepts_source_frame_count_without_source_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "01_interp_RES"
+            output_dir = root / "eval" / "01_RES"
+            input_dir.mkdir()
+
+            for frame_idx in [0, 16, 32]:
+                mask = np.zeros((6, 6), dtype=np.uint16)
+                mask[1:3, 1:3] = 7
+                tifffile.imwrite(input_dir / f"mask{frame_idx:03d}.tif", mask)
+            (input_dir / "res_track.txt").write_text("7 0 32 0\n", encoding="utf-8")
+
+            report = temporal_downsample_ctc_results(
+                input_result_dir=input_dir,
+                output_result_dir=output_dir,
+                source_root=None,
+                sequence="01",
+                source_frame_count=3,
+                factor=16,
+                offset=0,
+            )
+
+            self.assertEqual(report["frames"], 3)
+            self.assertEqual(
+                (output_dir / "res_track.txt").read_text(encoding="utf-8"),
+                "1 0 2 0\n",
+            )
+
     def test_temporal_downsample_preserves_valid_parent_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
