@@ -48,7 +48,7 @@ def _parse_output_digits(output_digits: str, frame_count: int):
     return digits
 
 
-def _indexed_files(folder: Path, prefix: str):
+def _indexed_files(folder: Path, prefix: str, strict_names: bool = True):
     regex = re.compile(rf"^{re.escape(prefix)}(\d+)\.tiff?$", flags=re.IGNORECASE)
     indexed: dict[int, Path] = {}
 
@@ -70,7 +70,7 @@ def _indexed_files(folder: Path, prefix: str):
             raise ValueError(f"Duplicate {prefix} frame {frame_idx}: {indexed[frame_idx]} and {path}")
         indexed[frame_idx] = path
 
-    if bad_names:
+    if bad_names and strict_names:
         preview = ", ".join(bad_names[:10])
         raise ValueError(f"{folder} contains malformed {prefix}*.tif files: {preview}")
     return indexed
@@ -177,7 +177,7 @@ def subset_ctc_sequence_range(
             raise FileExistsError(f"{output_root} already exists and is not empty. Pass --overwrite to replace it.")
         shutil.rmtree(output_root)
 
-    image_src = _indexed_files(source_root / sequence, "t")
+    image_src = _indexed_files(source_root / sequence, "t", strict_names=False)
     tra_src_dir = source_root / f"{sequence}_GT" / "TRA"
     seg_src_dir = source_root / f"{sequence}_GT" / "SEG"
     tra_src = _indexed_files(tra_src_dir, "man_track")
