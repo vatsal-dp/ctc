@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import csv
 import re
 import shutil
 import sys
@@ -84,23 +85,50 @@ def _copy_reindexed_files(
     end_frame: int,
     output_digits: int,
     required: bool,
+    kind: str,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     copied = 0
     missing = []
+    records = []
     for source_frame in range(start_frame, end_frame + 1):
         source_path = source_files.get(source_frame)
+        output_frame = source_frame - start_frame
+        output_path = (
+            output_dir / f"{prefix}{output_frame:0{output_digits}d}{source_path.suffix.lower()}"
+            if source_path is not None
+            else output_dir / f"{prefix}{output_frame:0{output_digits}d}.tif"
+        )
         if source_path is None:
             missing.append(source_frame)
+            records.append(
+                {
+                    "kind": kind,
+                    "source_frame": source_frame,
+                    "output_frame": output_frame,
+                    "source_path": "",
+                    "output_path": str(output_path),
+                    "status": "missing",
+                }
+            )
             continue
-        output_frame = source_frame - start_frame
-        shutil.copy2(source_path, output_dir / f"{prefix}{output_frame:0{output_digits}d}{source_path.suffix.lower()}")
+        shutil.copy2(source_path, output_path)
+        records.append(
+            {
+                "kind": kind,
+                "source_frame": source_frame,
+                "output_frame": output_frame,
+                "source_path": str(source_path),
+                "output_path": str(output_path),
+                "status": "copied",
+            }
+        )
         copied += 1
 
     if missing and required:
         preview = ", ".join(str(frame) for frame in missing[:20])
         raise FileNotFoundError(f"Missing required {prefix} frames in source range: {preview}")
-    return copied, missing
+    return copied, missing, records
 
 
 def _parse_track_file(path: Path):
@@ -154,6 +182,16 @@ def _write_track_file(path: Path, rows: list[TrackRow]):
             handle.write(f"{row.label} {row.begin} {row.end} {row.parent}\n")
 
 
+def _write_mapping_file(path: Path, records: list[dict]):
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["kind", "source_frame", "output_frame", "source_path", "output_path", "status"],
+        )
+        writer.writeheader()
+        writer.writerows(records)
+
+
 def subset_ctc_sequence_range(
     source_root: Path,
     output_root: Path,
@@ -183,7 +221,8 @@ def subset_ctc_sequence_range(
     tra_src = _indexed_files(tra_src_dir, "man_track")
     seg_src = _indexed_files(seg_src_dir, "man_seg")
 
-    copied_images, missing_images = _copy_reindexed_files(
+    mapping_records = []
+    copied_images, missing_images, image_records = _copy_reindexed_files(
         image_src,
         output_root / sequence,
         "t",
@@ -191,8 +230,10 @@ def subset_ctc_sequence_range(
         end_frame,
         digits,
         required=False,
+        kind="image",
     )
-    copied_tra, _ = _copy_reindexed_files(
+    mapping_records.extend(image_records)
+    copied_tra, _, tra_records = _copy_reindexed_files(
         tra_src,
         output_root / f"{sequence}_GT" / "TRA",
         "man_track",
@@ -200,8 +241,10 @@ def subset_ctc_sequence_range(
         end_frame,
         digits,
         required=True,
+        kind="tra",
     )
-    copied_seg, missing_seg = _copy_reindexed_files(
+    mapping_records.extend(tra_records)
+    copied_seg, missing_seg, seg_records = _copy_reindexed_files(
         seg_src,
         output_root / f"{sequence}_GT" / "SEG",
         "man_seg",
@@ -209,11 +252,15 @@ def subset_ctc_sequence_range(
         end_frame,
         digits,
         required=False,
+        kind="seg",
     )
+    mapping_records.extend(seg_records)
 
     rows = _parse_track_file(tra_src_dir / "man_track.txt")
     clipped_rows = _clip_track_rows(rows, start_frame, end_frame)
     _write_track_file(output_root / f"{sequence}_GT" / "TRA" / "man_track.txt", clipped_rows)
+    mapping_path = output_root / "subset_frame_mapping.csv"
+    _write_mapping_file(mapping_path, mapping_records)
 
     return {
         "sequence": sequence,
@@ -227,6 +274,7 @@ def subset_ctc_sequence_range(
         "seg_masks": copied_seg,
         "missing_seg_masks": len(missing_seg),
         "track_rows": len(clipped_rows),
+        "mapping_file": mapping_path,
     }
 
 
