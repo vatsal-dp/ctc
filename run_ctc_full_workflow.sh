@@ -9,6 +9,10 @@ OUTPUT_ROOT=""
 FILM_MODEL=""
 CELLPOSE_MODEL=""
 PYTHON_BIN="${PYTHON:-python}"
+PYTHON_EXPLICIT=0
+ENV_MANAGER="${CTC_ENV_MANAGER:-auto}"
+ENV_NAME="${CTC_ENV_NAME:-ctc-workflow}"
+ENV_DIR="${CTC_ENV_DIR:-}"
 SEQUENCES=()
 CTC_ENTRYPOINT_MODE=0
 CTC_DATASET_NAME=""
@@ -400,7 +404,11 @@ parse_args() {
       --film-num-workers) FILM_NUM_WORKERS="${2:?}"; shift 2 ;;
       --film-write-threads) FILM_WRITE_THREADS="${2:?}"; shift 2 ;;
       --film-output-digits) FILM_OUTPUT_DIGITS="${2:?}"; shift 2 ;;
-      --python) PYTHON_BIN="${2:?}"; shift 2 ;;
+      --python) PYTHON_BIN="${2:?}"; PYTHON_EXPLICIT=1; shift 2 ;;
+      --env-manager) ENV_MANAGER="${2:?}"; shift 2 ;;
+      --env-name) ENV_NAME="${2:?}"; shift 2 ;;
+      --env-dir) ENV_DIR="$(path_arg "${2:?}")"; shift 2 ;;
+      --no-env-bootstrap) ENV_MANAGER="none"; shift ;;
       --cellpose-chan) CELLPOSE_CHAN="${2:?}"; shift 2 ;;
       --cellpose-diameter) CELLPOSE_DIAMETER="${2:?}"; shift 2 ;;
       --cellpose-no-gpu) CELLPOSE_USE_GPU=0; shift ;;
@@ -431,11 +439,26 @@ parse_args() {
   done
 }
 
+validate_env_options() {
+  case "$ENV_MANAGER" in
+    auto|conda|venv|none)
+      ;;
+    *)
+      die "--env-manager must be auto, conda, venv, or none"
+      ;;
+  esac
+
+  if [[ -z "$ENV_NAME" ]]; then
+    die "--env-name cannot be empty"
+  fi
+}
+
 validate_args() {
   [[ -n "$DATASET_ROOT" ]] || die "--dataset-root is required"
   [[ -n "$WORK_ROOT" ]] || die "--work-root is required"
   [[ -n "$OUTPUT_ROOT" ]] || die "--output-root is required"
   [[ -n "$CELLPOSE_MODEL" ]] || die "--cellpose-model is required"
+  validate_env_options
   [[ -d "$DATASET_ROOT" ]] || die "dataset root does not exist: $DATASET_ROOT"
   [[ -f "$TRACKING_SCRIPT" ]] || die "tracking script does not exist: $TRACKING_SCRIPT"
 
@@ -531,11 +554,10 @@ run_sequence() {
     log "skip segmentation for $sequence"
   fi
 
-  local mask_dir
-  mask_dir="$(resolve_mask_dir "$interpolated_dir" "$CELLPOSE_MASK_DIR")"
-  log "segmentation masks: $mask_dir pattern=$SEG_MASK_PATTERN"
-
   if [[ "$SKIP_TRACKING" -eq 0 ]]; then
+    local mask_dir
+    mask_dir="$(resolve_mask_dir "$interpolated_dir" "$CELLPOSE_MASK_DIR")"
+    log "segmentation masks: $mask_dir pattern=$SEG_MASK_PATTERN"
     run_cmd "$log_dir/03_tracking.log" \
       "$PYTHON_BIN" "$TRACKING_SCRIPT" \
       --mask-dir "$mask_dir" \
