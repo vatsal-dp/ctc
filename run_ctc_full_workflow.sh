@@ -76,7 +76,7 @@ Core options:
   --interpolation-factor N  Temporal factor. Must be a power of two; default: 16.
   --film-cycles N           Override FILM cycles. Default: log2(interpolation-factor).
   --film-model PATH         Optional FILM SavedModel path. If omitted, interpolate_between_series_rapid.py uses its default.
-  --python CMD              Python command. Default: python.
+  --python CMD              Python command for all Python stages; must import cellpose unless segmentation is skipped. Default: python.
   --dry-run                 Print/log commands without running FILM, Cellpose, tracking, or validation.
   --overwrite               Remove this script's per-sequence work/output folders before running.
 
@@ -254,6 +254,15 @@ cycles_for_factor() {
     die "--interpolation-factor must be a power of two"
   fi
   printf '%s\n' "$cycles"
+}
+
+require_cellpose_available() {
+  if [[ "$DRY_RUN" -eq 1 || "$SKIP_SEGMENTATION" -eq 1 ]]; then
+    return 0
+  fi
+
+  "$PYTHON_BIN" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('cellpose') else 1)" >/dev/null 2>&1 \
+    || die "Cellpose is not importable with --python '$PYTHON_BIN'. Install Cellpose in that environment or pass --python PATH_TO_ENV_PYTHON."
 }
 
 has_masks() {
@@ -435,6 +444,8 @@ validate_args() {
   if [[ "$RUN_EVALUATION" -eq 1 && -z "$CTC_SOFTWARE_DIR" ]]; then
     die "--ctc-software-dir is required with --run-evaluation"
   fi
+
+  require_cellpose_available
 
   if [[ "${#SEQUENCES[@]}" -eq 0 ]]; then
     local discovered

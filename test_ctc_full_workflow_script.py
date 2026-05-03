@@ -118,6 +118,59 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn("interpolate_between_series_rapid.py", result.stdout)
             self.assertNotIn("--model_path", result.stdout)
 
+    def test_missing_cellpose_module_fails_before_interpolation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = root / "BF-C2DL-HSC"
+            work_root = root / "work"
+            output_root = root / "submission"
+            cellpose_model = root / "cellpose_model"
+            fake_python = root / "python"
+            for folder in [dataset_root / "01", cellpose_model]:
+                folder.mkdir(parents=True)
+            fake_python.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "if sys.argv[1:2] == ['-c'] and 'cellpose' in sys.argv[2]:\n"
+                "    sys.exit(1)\n"
+                "if sys.argv[1:3] == ['-m', 'cellpose']:\n"
+                "    sys.stderr.write('No module named cellpose\\n')\n"
+                "    sys.exit(1)\n"
+                "sys.exit(0)\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT),
+                    "--dataset-root",
+                    str(dataset_root),
+                    "--work-root",
+                    str(work_root),
+                    "--output-root",
+                    str(output_root),
+                    "--cellpose-model",
+                    str(cellpose_model),
+                    "--python",
+                    str(fake_python),
+                    "--sequences",
+                    "01",
+                    "--stage-gt",
+                    "none",
+                    "--skip-validation",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertNotEqual(result.returncode, 0, msg=result.stdout)
+            self.assertIn("Cellpose is not importable", result.stdout)
+            self.assertNotIn("interpolate_between_series_rapid.py", result.stdout)
+
     def test_no_arg_ctc_entrypoint_infers_dataset_sequence_and_relative_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
