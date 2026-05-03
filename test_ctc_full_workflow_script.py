@@ -77,6 +77,45 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn("temporal_downsample_ctc_results.py", result.stdout)
             self.assertNotIn("notes", result.stdout)
 
+    def test_dry_run_can_use_film_runner_default_model_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = root / "BF-C2DL-HSC"
+            work_root = root / "work"
+            output_root = root / "submission"
+            cellpose_model = root / "cellpose_model"
+            for folder in [dataset_root / "01", cellpose_model]:
+                folder.mkdir(parents=True)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT),
+                    "--dataset-root",
+                    str(dataset_root),
+                    "--work-root",
+                    str(work_root),
+                    "--output-root",
+                    str(output_root),
+                    "--cellpose-model",
+                    str(cellpose_model),
+                    "--sequences",
+                    "01",
+                    "--stage-gt",
+                    "none",
+                    "--skip-validation",
+                    "--dry-run",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stdout)
+            self.assertIn("interpolate_between_series_rapid.py", result.stdout)
+            self.assertNotIn("--model_path", result.stdout)
+
     def test_no_arg_ctc_entrypoint_infers_dataset_sequence_and_relative_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

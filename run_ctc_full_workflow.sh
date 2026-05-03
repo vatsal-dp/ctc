@@ -69,13 +69,13 @@ Required paths:
   --dataset-root PATH       CTC dataset root containing sequence folders like 01, 02.
   --work-root PATH          Scratch/work folder for interpolated frames, masks, logs, and intermediate tracking.
   --output-root PATH        Final CTC-format output root containing 01_RES, 02_RES, etc.
-  --film-model PATH         FILM TensorFlow SavedModel path.
   --cellpose-model PATH     Cellpose pretrained model path.
 
 Core options:
   --sequences "01 02"       Space-separated sequence IDs. Default: auto-detect numeric folders.
   --interpolation-factor N  Temporal factor. Must be a power of two; default: 16.
   --film-cycles N           Override FILM cycles. Default: log2(interpolation-factor).
+  --film-model PATH         Optional FILM SavedModel path. If omitted, interpolate_between_series_rapid.py uses its default.
   --python CMD              Python command. Default: python.
   --dry-run                 Print/log commands without running FILM, Cellpose, tracking, or validation.
   --overwrite               Remove this script's per-sequence work/output folders before running.
@@ -116,7 +116,6 @@ Example:
     --dataset-root /data/BF-C2DL-HSC \
     --work-root /scratch/ctc_work/BF-C2DL-HSC \
     --output-root /scratch/ctc_submission/BF-C2DL-HSC \
-    --film-model /models/film/Style/saved_model \
     --cellpose-model /models/CTC_fullscale
 EOF
 }
@@ -423,7 +422,6 @@ validate_args() {
   [[ -n "$DATASET_ROOT" ]] || die "--dataset-root is required"
   [[ -n "$WORK_ROOT" ]] || die "--work-root is required"
   [[ -n "$OUTPUT_ROOT" ]] || die "--output-root is required"
-  [[ -n "$FILM_MODEL" ]] || die "--film-model is required"
   [[ -n "$CELLPOSE_MODEL" ]] || die "--cellpose-model is required"
   [[ -d "$DATASET_ROOT" ]] || die "dataset root does not exist: $DATASET_ROOT"
   [[ -f "$TRACKING_SCRIPT" ]] || die "tracking script does not exist: $TRACKING_SCRIPT"
@@ -474,11 +472,10 @@ run_sequence() {
   log "final result: $final_result_dir"
 
   if [[ "$SKIP_INTERPOLATION" -eq 0 ]]; then
-    run_cmd "$log_dir/01_interpolate.log" \
+    local -a interpolate_cmd=(
       "$PYTHON_BIN" "$SCRIPT_DIR/interpolate_between_series_rapid.py" \
       --input_dir "$source_dir" \
       --output_dir "$interpolated_dir" \
-      --model_path "$FILM_MODEL" \
       --cycles "$FILM_CYCLES" \
       --batch_size "$FILM_BATCH_SIZE" \
       --num_workers "$FILM_NUM_WORKERS" \
@@ -486,6 +483,11 @@ run_sequence() {
       --output_ext tif \
       --output_prefix t \
       --output_digits "$FILM_OUTPUT_DIGITS"
+    )
+    if [[ -n "$FILM_MODEL" ]]; then
+      interpolate_cmd+=(--model_path "$FILM_MODEL")
+    fi
+    run_cmd "$log_dir/01_interpolate.log" "${interpolate_cmd[@]}"
   else
     log "skip interpolation for $sequence"
   fi
