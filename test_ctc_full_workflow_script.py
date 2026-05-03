@@ -62,6 +62,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         self.assertIn("cellpose<4", [line.strip().lower() for line in requirements])
         self.assertIn("opencv-python", packages)
         self.assertIn("tensorflow", packages)
+        self.assertIn("tensorflow<2.11", [line.strip().lower() for line in requirements])
         self.assertIn("torch", packages)
         self.assertIn("tqdm", packages)
 

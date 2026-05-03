@@ -6,6 +6,7 @@ matplotlib
 # The trained CTC_fullscale model is a Cellpose 3 model; Cellpose 4 rejects CP3 weights.
 cellpose<4
 opencv-python
-tensorflow
+# TensorFlow 2.10 is the last native Windows build with GPU support.
+tensorflow<2.11
 torch
 tqdm

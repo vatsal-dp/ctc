@@ -104,33 +104,34 @@ def _indexed_files(folder: Path, prefix: str):
     return indexed, digit_widths
 
 
-def _require_contiguous_from_zero(indexed: dict[int, Path], label: str):
+def _require_contiguous(indexed: dict[int, Path], label: str, require_zero_start: bool = True):
     if not indexed:
         raise ValueError(f"No {label} files found.")
     observed = sorted(indexed)
-    expected = list(range(observed[-1] + 1))
+    expected_start = 0 if require_zero_start else observed[0]
+    expected = list(range(expected_start, observed[-1] + 1))
     if observed != expected:
         missing = sorted(set(expected) - set(observed))
         preview = ", ".join(str(idx) for idx in missing[:20])
-        raise ValueError(f"{label} files are not contiguous from frame 0. Missing indices: {preview}")
+        start_text = "frame 0" if require_zero_start else f"frame {expected_start}"
+        raise ValueError(f"{label} files are not contiguous from {start_text}. Missing indices: {preview}")
 
 
-def _source_frame_count_and_digits(source_root: Path, sequence: str):
+def _source_frame_indices_and_digits(source_root: Path, sequence: str):
     sequence = _normalize_sequence(sequence)
     candidates = [
-        (source_root / sequence, "t", True),
+        (source_root / sequence, "t", False),
         (source_root / f"{sequence}_GT" / "TRA", "man_track", False),
         (source_root / f"{sequence}_GT" / "SEG", "man_seg", False),
     ]
 
-    for folder, prefix, require_contiguous in candidates:
+    for folder, prefix, require_zero_start in candidates:
         indexed, digit_widths = _indexed_files(folder, prefix)
         if not indexed:
             continue
-        if require_contiguous:
-            _require_contiguous_from_zero(indexed, f"{prefix} source")
+        _require_contiguous(indexed, f"{prefix} source", require_zero_start=require_zero_start)
         source_digits = int(next(iter(digit_widths))) if len(digit_widths) == 1 else None
-        return max(indexed) + 1, source_digits
+        return sorted(indexed), source_digits
 
     raise FileNotFoundError(
         f"Could not infer frame count from {source_root / sequence}, "
@@ -236,11 +237,11 @@ def _contiguous_runs(frames: list[int]):
     return runs
 
 
-def _scan_sampled_label_frames(selected_mask_files: list[Path | None]):
+def _scan_sampled_label_frames(selected_mask_files: list[Path | None], output_frame_indices: list[int]):
     label_frames: dict[int, list[int]] = {}
     reference_shape = None
 
-    for output_frame_idx, mask_path in enumerate(selected_mask_files):
+    for output_frame_idx, mask_path in zip(output_frame_indices, selected_mask_files):
         if mask_path is None:
             continue
         mask = _read_mask(mask_path)
@@ -302,11 +303,12 @@ def _build_output_tracks(
     return output_rows
 
 
-def _build_frame_label_maps(output_rows: list[OutputTrackRow], frame_count: int):
-    frame_maps: list[dict[int, int]] = [{} for _ in range(frame_count)]
+def _build_frame_label_maps(output_rows: list[OutputTrackRow], output_frame_indices: list[int]):
+    frame_maps: dict[int, dict[int, int]] = {frame_idx: {} for frame_idx in output_frame_indices}
     for row in output_rows:
         for frame_idx in range(row.begin, row.end + 1):
-            frame_maps[frame_idx][row.old_label] = row.label
+            if frame_idx in frame_maps:
+                frame_maps[frame_idx][row.old_label] = row.label
     return frame_maps
 
 
@@ -360,10 +362,11 @@ def temporal_downsample_ctc_results(
         raise NotADirectoryError(f"source-root does not exist: {source_root}")
 
     if source_frame_count is None:
-        expected_frame_count, source_digits = _source_frame_count_and_digits(source_root, sequence)
+        output_frame_indices, source_digits = _source_frame_indices_and_digits(source_root, sequence)
     else:
-        expected_frame_count = source_frame_count
+        output_frame_indices = list(range(source_frame_count))
         source_digits = None
+    expected_frame_count = len(output_frame_indices)
     if target_shape is None and source_root is not None:
         try:
             target_shape = _target_shape_from_gt(source_root, sequence)
@@ -396,13 +399,13 @@ def temporal_downsample_ctc_results(
     blank_shape = target_shape
     if blank_shape is None and first_available_mask is not None:
         blank_shape = tuple(_read_mask(first_available_mask).shape)
-    label_frames, reference_shape = _scan_sampled_label_frames(selected_mask_files)
+    label_frames, reference_shape = _scan_sampled_label_frames(selected_mask_files, output_frame_indices)
     input_rows = _parse_input_tracks(input_result_dir / "res_track.txt")
     output_rows = _build_output_tracks(label_frames, input_rows)
-    frame_label_maps = _build_frame_label_maps(output_rows, expected_frame_count)
+    frame_label_maps = _build_frame_label_maps(output_rows, output_frame_indices)
 
     _clear_ctc_outputs(output_result_dir)
-    for output_frame_idx, input_mask_path in enumerate(selected_mask_files):
+    for output_frame_idx, input_mask_path in zip(output_frame_indices, selected_mask_files):
         if input_mask_path is None:
             if blank_shape is None:
                 raise ValueError("Cannot write empty mask before an available frame establishes the output shape.")
@@ -432,6 +435,8 @@ def temporal_downsample_ctc_results(
         "output_result_dir": output_result_dir,
         "selected_first": selected_input_indices[0] if selected_input_indices else None,
         "selected_last": selected_input_indices[-1] if selected_input_indices else None,
+        "output_first": output_frame_indices[0] if output_frame_indices else None,
+        "output_last": output_frame_indices[-1] if output_frame_indices else None,
         "missing_selected_frames": len(missing),
         "shape": reference_shape,
         "target_shape": target_shape,

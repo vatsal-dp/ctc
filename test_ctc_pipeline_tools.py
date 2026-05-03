@@ -452,10 +452,10 @@ class CTCPipelineToolTests(unittest.TestCase):
                     digits_arg="3",
                 )
 
-    def _write_source_frames(self, source_root: Path, sequence: str, frame_count: int, shape=(6, 6)):
+    def _write_source_frames(self, source_root: Path, sequence: str, frame_count: int, shape=(6, 6), start=0):
         image_dir = source_root / sequence
         image_dir.mkdir(parents=True)
-        for frame_idx in range(frame_count):
+        for frame_idx in range(start, start + frame_count):
             tifffile.imwrite(image_dir / f"t{frame_idx:03d}.tif", np.zeros(shape, dtype=np.uint16))
 
     def test_temporal_downsample_selects_every_16th_frame_and_rebuilds_tracks(self):
@@ -507,6 +507,49 @@ class CTCPipelineToolTests(unittest.TestCase):
             )
             self.assertEqual(validation["frames"], 3)
             self.assertEqual(validation["tracks"], 2)
+
+    def test_temporal_downsample_preserves_nonzero_source_frame_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            input_dir = root / "01_interp_RES"
+            output_dir = root / "eval" / "01_RES"
+            self._write_source_frames(source, "01", frame_count=3, start=20)
+            input_dir.mkdir()
+
+            for frame_idx in [0, 2, 4]:
+                mask = np.zeros((6, 6), dtype=np.uint16)
+                mask[1:3, 1:3] = 7
+                tifffile.imwrite(input_dir / f"mask{frame_idx:03d}.tif", mask)
+            (input_dir / "res_track.txt").write_text("7 0 4 0\n", encoding="utf-8")
+
+            report = temporal_downsample_ctc_results(
+                input_result_dir=input_dir,
+                output_result_dir=output_dir,
+                source_root=source,
+                sequence="01",
+                factor=2,
+                offset=0,
+            )
+
+            self.assertEqual(report["frames"], 3)
+            self.assertEqual(report["output_first"], 20)
+            self.assertEqual(report["output_last"], 22)
+            self.assertEqual([path.name for path in sorted(output_dir.glob("mask*.tif"))], [
+                "mask020.tif",
+                "mask021.tif",
+                "mask022.tif",
+            ])
+            self.assertEqual((output_dir / "res_track.txt").read_text(encoding="utf-8"), "1 20 22 0\n")
+
+            validation = validate_ctc_result_format(
+                dataset_root=output_dir.parent,
+                source_root=source,
+                sequence="01",
+                digits_arg="auto",
+            )
+            self.assertEqual(validation["frames"], 3)
+            self.assertEqual(validation["tracks"], 1)
 
     def test_temporal_downsample_splits_discontinuous_sampled_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
