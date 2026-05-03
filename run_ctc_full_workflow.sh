@@ -455,19 +455,27 @@ require_python_modules_available() {
 
   local missing
   missing="$("$PYTHON_BIN" -c "
-import importlib.util
+import importlib
 import sys
 
-modules = sys.argv[1:]
-missing = [module for module in modules if importlib.util.find_spec(module) is None]
-if missing:
-    print(', '.join(missing))
+modules = dict.fromkeys(sys.argv[1:])
+problems = []
+for module in modules:
+    try:
+        importlib.import_module(module)
+    except Exception as exc:
+        problems.append(f'{module}: {exc.__class__.__name__}: {exc}')
+if problems:
+    print('\n'.join(problems))
     sys.exit(1)
 " "${modules[@]}" 2>/dev/null)" || {
     if [[ "$missing" == *cellpose* ]]; then
       die "Cellpose is not importable with '$PYTHON_BIN'. Re-run with environment bootstrap enabled or inspect requirements.txt."
     fi
-    die "Required Python modules are not importable with '$PYTHON_BIN'. Missing: ${missing:-unknown}. Re-run with environment bootstrap enabled or inspect requirements.txt."
+    if [[ "$missing" == *tensorflow* ]]; then
+      die "TensorFlow is not importable with '$PYTHON_BIN'. If NumPy 2.x is installed, run '$PYTHON_BIN' -m pip install 'numpy<2' or re-run with environment bootstrap enabled. Details: ${missing:-unknown}"
+    fi
+    die "Required Python modules are not importable with '$PYTHON_BIN'. Details: ${missing:-unknown}. Re-run with environment bootstrap enabled or inspect requirements.txt."
   }
 }
 

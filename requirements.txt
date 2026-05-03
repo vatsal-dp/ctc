@@ -1,4 +1,5 @@
-numpy
+# TensorFlow <2.11 Windows wheels were built against the NumPy 1.x ABI.
+numpy<2
 scipy
 scikit-image
 tifffile
