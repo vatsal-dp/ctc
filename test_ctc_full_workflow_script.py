@@ -47,7 +47,11 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         requirements = (
             SCRIPT.parent / "requirements.txt"
         ).read_text(encoding="utf-8").splitlines()
-        packages = {line.strip().lower() for line in requirements if line.strip()}
+        packages = {
+            line.strip().lower().split("<", 1)[0]
+            for line in requirements
+            if line.strip() and not line.lstrip().startswith("#")
+        }
 
         self.assertIn("numpy", packages)
         self.assertIn("scipy", packages)
@@ -55,6 +59,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         self.assertIn("tifffile", packages)
         self.assertIn("matplotlib", packages)
         self.assertIn("cellpose", packages)
+        self.assertIn("cellpose<4", [line.strip().lower() for line in requirements])
         self.assertIn("opencv-python", packages)
         self.assertIn("tensorflow", packages)
         self.assertIn("torch", packages)

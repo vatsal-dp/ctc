@@ -3,7 +3,8 @@ scipy
 scikit-image
 tifffile
 matplotlib
-cellpose
+# The trained CTC_fullscale model is a Cellpose 3 model; Cellpose 4 rejects CP3 weights.
+cellpose<4
 opencv-python
 tensorflow
 torch
