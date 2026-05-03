@@ -72,6 +72,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stdout)
             self.assertIn("sequences: 01 02", result.stdout)
             self.assertIn("interpolate_between_series_rapid.py", result.stdout)
+            self.assertIn("--batch_size 1", result.stdout)
             self.assertIn("--num_workers 0", result.stdout)
             self.assertIn("python -m cellpose", result.stdout)
             self.assertIn("ram_run_tiptracking_standalone_optimized.py", result.stdout)
