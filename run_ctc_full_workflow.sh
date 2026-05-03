@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Keep system/user-site Python packages from leaking into the workflow env.
+export PYTHONNOUSERSITE=1
+
 DATASET_ROOT=""
 WORK_ROOT=""
 OUTPUT_ROOT=""

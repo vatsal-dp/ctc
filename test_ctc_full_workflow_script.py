@@ -286,6 +286,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
 
             env_python.write_text(
                 "#!/bin/sh\n"
+                f"echo \"env-python PYTHONNOUSERSITE=$PYTHONNOUSERSITE\" >> {shlex.quote(str(bootstrap_log))}\n"
                 f"echo \"env-python $@\" >> {shlex.quote(str(bootstrap_log))}\n"
                 "exit 0\n",
                 encoding="utf-8",
@@ -344,6 +345,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn("creating conda/mamba environment: ctc-workflow", result.stdout)
             self.assertIn(f"environment python: {env_python}", result.stdout)
             log = bootstrap_log.read_text(encoding="utf-8")
+            self.assertIn("env-python PYTHONNOUSERSITE=1", log)
             self.assertIn("mamba create -y -n ctc-workflow python=3.10 pip", log)
             self.assertIn("env-python -m pip install --upgrade pip", log)
             self.assertIn("env-python -m pip install -r", log)
@@ -371,6 +373,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
                 "  mkdir -p \"$env_dir/bin\"\n"
                 "  cat > \"$env_dir/bin/python\" <<PY\n"
                 "#!/bin/sh\n"
+                "echo \"env-python PYTHONNOUSERSITE=\\$PYTHONNOUSERSITE\" >> \"$log\"\n"
                 "echo \"env-python \\$@\" >> \"$log\"\n"
                 "exit 0\n"
                 "PY\n"
@@ -415,6 +418,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn(f"creating venv: {env_dir}", result.stdout)
             self.assertIn(f"environment python: {env_dir / 'bin' / 'python'}", result.stdout)
             log = bootstrap_log.read_text(encoding="utf-8")
+            self.assertIn("env-python PYTHONNOUSERSITE=1", log)
             self.assertIn(f"base-python -m venv {env_dir}", log)
             self.assertIn("env-python -m pip install --upgrade pip", log)
             self.assertIn("env-python -m pip install -r", log)
