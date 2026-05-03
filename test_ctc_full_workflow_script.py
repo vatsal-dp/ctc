@@ -110,6 +110,8 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, msg=result.stdout)
             self.assertIn("sequences: 01 02", result.stdout)
+            self.assertIn("interpolation-factor: 2 cycles: 1", result.stdout)
+            self.assertIn("images_interpolated_2x_tif", result.stdout)
             self.assertIn("interpolate_between_series_rapid.py", result.stdout)
             self.assertIn("--batch_size 1", result.stdout)
             self.assertIn("--num_workers 0", result.stdout)

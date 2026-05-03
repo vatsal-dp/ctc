@@ -21,7 +21,7 @@ SEQUENCES=()
 CTC_ENTRYPOINT_MODE=0
 CTC_DATASET_NAME=""
 
-INTERPOLATION_FACTOR=16
+INTERPOLATION_FACTOR=2
 FILM_CYCLES=""
 FILM_BATCH_SIZE=1
 FILM_NUM_WORKERS=0
@@ -81,7 +81,7 @@ Required paths:
 
 Core options:
   --sequences "01 02"       Space-separated sequence IDs. Default: auto-detect numeric folders.
-  --interpolation-factor N  Temporal factor. Must be a power of two; default: 16.
+  --interpolation-factor N  Temporal factor. Must be a power of two; default: 2.
   --film-cycles N           Override FILM cycles. Default: log2(interpolation-factor).
   --film-model PATH         Optional FILM SavedModel path. If omitted, interpolate_between_series_rapid.py uses its default.
   --python CMD              Python command for all Python stages; must import required modules unless bootstrap is enabled. Default: python.
