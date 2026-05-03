@@ -131,15 +131,16 @@ def _parse_indexed_files(folder: Path, prefix: str, digits: int):
     return indexed
 
 
-def _require_contiguous_indices(indexed: dict[int, Path], prefix: str):
+def _require_contiguous_indices(indexed: dict[int, Path], prefix: str, expected_start: int | None = 0):
     if not indexed:
         raise ValidationError(f"No {prefix}*.tif files found.")
     observed = sorted(indexed)
-    expected = list(range(observed[-1] + 1))
+    start = observed[0] if expected_start is None else expected_start
+    expected = list(range(start, observed[-1] + 1))
     if observed != expected:
         missing = sorted(set(expected) - set(observed))
         preview = ", ".join(str(idx) for idx in missing[:20])
-        raise ValidationError(f"{prefix} files are not contiguous from frame 0. Missing indices: {preview}")
+        raise ValidationError(f"{prefix} files are not contiguous from frame {start}. Missing indices: {preview}")
 
 
 def _parse_res_track(path: Path):
@@ -215,9 +216,10 @@ def validate_ctc_result_format(
 
     digits = resolve_digits(digits_arg, dataset_root, source_root, sequence)
     mask_files = _parse_indexed_files(result_dir, "mask", digits)
-    _require_contiguous_indices(mask_files, "mask")
-
     source_frames = _source_frame_index(source_root, dataset_root, sequence, digits)
+    expected_mask_start = min(source_frames) if source_frames else None
+    _require_contiguous_indices(mask_files, "mask", expected_start=expected_mask_start)
+
     if source_frames and sorted(mask_files) != sorted(source_frames):
         missing = sorted(set(source_frames) - set(mask_files))
         extra = sorted(set(mask_files) - set(source_frames))
