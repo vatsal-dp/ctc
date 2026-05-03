@@ -3,3 +3,8 @@ scipy
 scikit-image
 tifffile
 matplotlib
+cellpose
+opencv-python
+tensorflow
+torch
+tqdm

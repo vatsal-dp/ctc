@@ -77,6 +77,10 @@ Core options:
   --film-cycles N           Override FILM cycles. Default: log2(interpolation-factor).
   --film-model PATH         Optional FILM SavedModel path. If omitted, interpolate_between_series_rapid.py uses its default.
   --python CMD              Python command for all Python stages; must import cellpose unless segmentation is skipped. Default: python.
+  --env-manager MODE       Environment bootstrap: auto, conda, venv, or none. Default: auto.
+  --env-name NAME          Conda/mamba environment name. Default: ctc-workflow.
+  --env-dir PATH           Python venv directory. Default: WORK_ROOT/.ctc-env.
+  --no-env-bootstrap       Alias for --env-manager none.
   --dry-run                 Print/log commands without running FILM, Cellpose, tracking, or validation.
   --overwrite               Remove this script's per-sequence work/output folders before running.
 

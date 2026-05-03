@@ -26,6 +26,38 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         self.assertIn("--cellpose-model", result.stdout)
         self.assertIn("--output-root", result.stdout)
 
+    def test_help_documents_environment_bootstrap_options(self):
+        result = subprocess.run(
+            ["bash", str(SCRIPT), "--help"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stdout)
+        self.assertIn("--env-manager", result.stdout)
+        self.assertIn("--env-name", result.stdout)
+        self.assertIn("--env-dir", result.stdout)
+        self.assertIn("--no-env-bootstrap", result.stdout)
+
+    def test_requirements_include_workflow_runtime_dependencies(self):
+        requirements = (
+            SCRIPT.parent / "requirements.txt"
+        ).read_text(encoding="utf-8").splitlines()
+        packages = {line.strip().lower() for line in requirements if line.strip()}
+
+        self.assertIn("numpy", packages)
+        self.assertIn("scipy", packages)
+        self.assertIn("scikit-image", packages)
+        self.assertIn("tifffile", packages)
+        self.assertIn("matplotlib", packages)
+        self.assertIn("cellpose", packages)
+        self.assertIn("opencv-python", packages)
+        self.assertIn("tensorflow", packages)
+        self.assertIn("torch", packages)
+        self.assertIn("tqdm", packages)
+
     def test_dry_run_auto_detects_numeric_sequences_and_prints_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
