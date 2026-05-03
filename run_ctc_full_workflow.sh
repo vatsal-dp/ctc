@@ -13,6 +13,7 @@ PYTHON_EXPLICIT=0
 ENV_MANAGER="${CTC_ENV_MANAGER:-auto}"
 ENV_NAME="${CTC_ENV_NAME:-ctc-workflow}"
 ENV_DIR="${CTC_ENV_DIR:-}"
+ENV_PYTHON_VERSION="${CTC_ENV_PYTHON_VERSION:-3.10}"
 SEQUENCES=()
 CTC_ENTRYPOINT_MODE=0
 CTC_DATASET_NAME=""
@@ -84,6 +85,7 @@ Core options:
   --env-manager MODE       Environment bootstrap: auto, conda, venv, or none. Default: auto.
   --env-name NAME          Conda/mamba environment name. Default: ctc-workflow.
   --env-dir PATH           Python venv directory. Default: WORK_ROOT/.ctc-env.
+  --env-python-version N    Python version for new conda/mamba envs. Default: 3.10.
   --no-env-bootstrap       Alias for --env-manager none.
   --dry-run                 Print/log commands without running FILM, Cellpose, tracking, or validation.
   --overwrite               Remove this script's per-sequence work/output folders before running.
@@ -170,6 +172,27 @@ run_cmd() {
   printf '\nreturncode=%s\n' "$status" >> "$log_file"
   if [[ "$status" -ne 0 ]]; then
     die "command failed with return code $status. See $log_file"
+  fi
+}
+
+run_setup_cmd() {
+  local -a cmd=("$@")
+
+  printf '\n[CTC WORKFLOW] '
+  quote_cmd "${cmd[@]}"
+  printf '\n'
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '[DRY RUN] Setup command was not executed.\n'
+    return 0
+  fi
+
+  set +e
+  "${cmd[@]}"
+  local status="$?"
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    die "setup command failed with return code $status"
   fi
 }
 
@@ -264,13 +287,184 @@ cycles_for_factor() {
   printf '%s\n' "$cycles"
 }
 
-require_cellpose_available() {
-  if [[ "$DRY_RUN" -eq 1 || "$SKIP_SEGMENTATION" -eq 1 ]]; then
+find_conda_manager() {
+  if command -v mamba >/dev/null 2>&1; then
+    command -v mamba
+    return 0
+  fi
+  if command -v conda >/dev/null 2>&1; then
+    command -v conda
+    return 0
+  fi
+  return 1
+}
+
+conda_env_exists() {
+  local manager="$1"
+  "$manager" run -n "$ENV_NAME" python -c "import sys" >/dev/null 2>&1
+}
+
+resolve_conda_python() {
+  local manager="$1"
+  local resolved
+  resolved="$("$manager" run -n "$ENV_NAME" python -c "import sys; print(sys.executable)")" \
+    || die "could not resolve Python executable for conda environment '$ENV_NAME'"
+  [[ -n "$resolved" ]] || die "could not resolve Python executable for conda environment '$ENV_NAME'"
+  PYTHON_BIN="$resolved"
+}
+
+find_base_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return 0
+  fi
+  return 1
+}
+
+resolve_venv_python() {
+  local env_dir="$1"
+  local candidate
+  local -a candidates=(
+    "$env_dir/bin/python"
+    "$env_dir/Scripts/python.exe"
+    "$env_dir/Scripts/python"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -x "$candidate" ]]; then
+      PYTHON_BIN="$candidate"
+      return 0
+    fi
+  done
+
+  die "could not find Python executable inside venv: $env_dir"
+}
+
+install_python_requirements() {
+  local requirements_file="$SCRIPT_DIR/requirements.txt"
+  [[ -f "$requirements_file" ]] || die "requirements.txt not found next to workflow script: $requirements_file"
+
+  run_setup_cmd "$PYTHON_BIN" -m pip install --upgrade pip
+  run_setup_cmd "$PYTHON_BIN" -m pip install -r "$requirements_file"
+}
+
+bootstrap_conda_env() {
+  local manager="$1"
+  if conda_env_exists "$manager"; then
+    log "using existing conda/mamba environment: $ENV_NAME"
+  else
+    log "creating conda/mamba environment: $ENV_NAME"
+    run_setup_cmd "$manager" create -y -n "$ENV_NAME" "python=$ENV_PYTHON_VERSION" pip
+  fi
+
+  resolve_conda_python "$manager"
+  log "environment python: $PYTHON_BIN"
+  install_python_requirements
+}
+
+bootstrap_venv_env() {
+  local base_python="$1"
+  if [[ -z "$ENV_DIR" ]]; then
+    ENV_DIR="$WORK_ROOT/.ctc-env"
+  fi
+
+  if [[ -x "$ENV_DIR/bin/python" || -x "$ENV_DIR/Scripts/python.exe" || -x "$ENV_DIR/Scripts/python" ]]; then
+    log "using existing venv: $ENV_DIR"
+  else
+    log "creating venv: $ENV_DIR"
+    run_setup_cmd "$base_python" -m venv "$ENV_DIR"
+  fi
+
+  resolve_venv_python "$ENV_DIR"
+  log "environment python: $PYTHON_BIN"
+  install_python_requirements
+}
+
+bootstrap_python_environment() {
+  local manager base_python
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "dry-run: skipping environment bootstrap"
+    return 0
+  fi
+  if [[ "$PYTHON_EXPLICIT" -eq 1 ]]; then
+    log "using explicit --python; skipping environment bootstrap"
+    return 0
+  fi
+  if [[ "$ENV_MANAGER" == "none" ]]; then
+    log "environment bootstrap disabled"
     return 0
   fi
 
-  "$PYTHON_BIN" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('cellpose') else 1)" >/dev/null 2>&1 \
-    || die "Cellpose is not importable with --python '$PYTHON_BIN'. Install Cellpose in that environment or pass --python PATH_TO_ENV_PYTHON."
+  case "$ENV_MANAGER" in
+    auto)
+      if manager="$(find_conda_manager)"; then
+        bootstrap_conda_env "$manager"
+        return 0
+      fi
+      base_python="$(find_base_python)" \
+        || die "could not bootstrap environment: neither mamba/conda nor python3/python is available on PATH"
+      bootstrap_venv_env "$base_python"
+      ;;
+    conda)
+      manager="$(find_conda_manager)" \
+        || die "--env-manager conda requested, but neither mamba nor conda is available on PATH"
+      bootstrap_conda_env "$manager"
+      ;;
+    venv)
+      base_python="$(find_base_python)" \
+        || die "--env-manager venv requested, but neither python3 nor python is available on PATH"
+      bootstrap_venv_env "$base_python"
+      ;;
+  esac
+}
+
+require_python_modules_available() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+
+  local -a modules=()
+  if [[ "$SKIP_INTERPOLATION" -eq 0 ]]; then
+    modules+=(numpy cv2 tifffile tensorflow torch tqdm)
+  fi
+  if [[ "$SKIP_SEGMENTATION" -eq 0 ]]; then
+    modules+=(cellpose)
+  fi
+  if [[ "$SKIP_TRACKING" -eq 0 ]]; then
+    modules+=(numpy tifffile scipy skimage)
+  fi
+  if [[ "$SKIP_DOWNSAMPLE" -eq 0 ]]; then
+    modules+=(numpy tifffile skimage)
+  fi
+  if [[ "$SKIP_VALIDATION" -eq 0 || "$RUN_EVALUATION" -eq 1 ]]; then
+    modules+=(numpy tifffile)
+  fi
+
+  if [[ "${#modules[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  local missing
+  missing="$("$PYTHON_BIN" -c "
+import importlib.util
+import sys
+
+modules = sys.argv[1:]
+missing = [module for module in modules if importlib.util.find_spec(module) is None]
+if missing:
+    print(', '.join(missing))
+    sys.exit(1)
+" "${modules[@]}" 2>/dev/null)" || {
+    if [[ "$missing" == *cellpose* ]]; then
+      die "Cellpose is not importable with '$PYTHON_BIN'. Re-run with environment bootstrap enabled or inspect requirements.txt."
+    fi
+    die "Required Python modules are not importable with '$PYTHON_BIN'. Missing: ${missing:-unknown}. Re-run with environment bootstrap enabled or inspect requirements.txt."
+  }
 }
 
 has_masks() {
@@ -408,6 +602,7 @@ parse_args() {
       --env-manager) ENV_MANAGER="${2:?}"; shift 2 ;;
       --env-name) ENV_NAME="${2:?}"; shift 2 ;;
       --env-dir) ENV_DIR="$(path_arg "${2:?}")"; shift 2 ;;
+      --env-python-version) ENV_PYTHON_VERSION="${2:?}"; shift 2 ;;
       --no-env-bootstrap) ENV_MANAGER="none"; shift ;;
       --cellpose-chan) CELLPOSE_CHAN="${2:?}"; shift 2 ;;
       --cellpose-diameter) CELLPOSE_DIAMETER="${2:?}"; shift 2 ;;
@@ -451,6 +646,9 @@ validate_env_options() {
   if [[ -z "$ENV_NAME" ]]; then
     die "--env-name cannot be empty"
   fi
+  if [[ -z "$ENV_PYTHON_VERSION" ]]; then
+    die "--env-python-version cannot be empty"
+  fi
 }
 
 validate_args() {
@@ -471,8 +669,6 @@ validate_args() {
   if [[ "$RUN_EVALUATION" -eq 1 && -z "$CTC_SOFTWARE_DIR" ]]; then
     die "--ctc-software-dir is required with --run-evaluation"
   fi
-
-  require_cellpose_available
 
   if [[ "${#SEQUENCES[@]}" -eq 0 ]]; then
     local discovered
@@ -618,6 +814,8 @@ main() {
   fi
   parse_args "$@"
   validate_args
+  bootstrap_python_environment
+  require_python_modules_available
 
   if [[ "$CTC_ENTRYPOINT_MODE" -eq 1 ]]; then
     log "CTC entrypoint mode: dataset=$CTC_DATASET_NAME sequence=${SEQUENCES[*]}"
