@@ -29,6 +29,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         self.assertIn("--tracking-mmap-dir", result.stdout)
         self.assertIn("--tracking-io-workers", result.stdout)
         self.assertIn("--tracking-tiff-write-workers", result.stdout)
+        self.assertIn("--tracking-export-mode", result.stdout)
 
     def test_help_documents_environment_bootstrap_options(self):
         result = subprocess.run(
@@ -122,7 +123,11 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn("--num_workers 0", result.stdout)
             self.assertIn("python -m cellpose", result.stdout)
             self.assertIn("ram_run_tiptracking_standalone_optimized.py", result.stdout)
-            self.assertIn("temporal_downsample_ctc_results.py", result.stdout)
+            self.assertIn("--export-mode final-only", result.stdout)
+            self.assertIn("--temporal-downsample-factor 2", result.stdout)
+            self.assertIn("--final-output-dir", result.stdout)
+            self.assertIn("skip temporal downsample for 01; tracking wrote final-only result", result.stdout)
+            self.assertNotIn("temporal_downsample_ctc_results.py", result.stdout)
             self.assertNotIn("notes", result.stdout)
 
     def test_dry_run_can_use_film_runner_default_model_path(self):
@@ -213,6 +218,48 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn("--io-workers 4", result.stdout)
             self.assertIn("--io-queue-depth 16", result.stdout)
             self.assertIn("--tiff-write-workers 8", result.stdout)
+            self.assertIn("--export-mode final-only", result.stdout)
+
+    def test_dry_run_full_tracking_export_mode_uses_separate_downsample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = root / "BF-C2DL-HSC"
+            work_root = root / "work"
+            output_root = root / "submission"
+            cellpose_model = root / "cellpose_model"
+            for folder in [dataset_root / "02", cellpose_model]:
+                folder.mkdir(parents=True)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT),
+                    "--dataset-root",
+                    str(dataset_root),
+                    "--work-root",
+                    str(work_root),
+                    "--output-root",
+                    str(output_root),
+                    "--cellpose-model",
+                    str(cellpose_model),
+                    "--sequences",
+                    "02",
+                    "--stage-gt",
+                    "none",
+                    "--skip-validation",
+                    "--tracking-export-mode",
+                    "full",
+                    "--dry-run",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stdout)
+            self.assertIn("--export-mode full", result.stdout)
+            self.assertIn("temporal_downsample_ctc_results.py", result.stdout)
 
     def test_missing_cellpose_module_fails_before_interpolation(self):
         with tempfile.TemporaryDirectory() as tmp:

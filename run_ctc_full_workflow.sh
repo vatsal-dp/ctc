@@ -43,6 +43,7 @@ TRACKING_MMAP_DIR=""
 TRACKING_IO_WORKERS=1
 TRACKING_IO_QUEUE_DEPTH=4
 TRACKING_TIFF_WRITE_WORKERS=4
+TRACKING_EXPORT_MODE="final-only"
 TRACK_OUTPUT_DIGITS="auto"
 FINAL_OUTPUT_DIGITS="auto"
 TEMPORAL_DOWNSAMPLE_OFFSET=0
@@ -116,6 +117,8 @@ Tracking/downsampling options:
                             Decoded mask prefetch queue depth for tracking. Default: 4.
   --tracking-tiff-write-workers N
                             TIFF output write threads for tracking. Default: 4.
+  --tracking-export-mode MODE
+                            final-only or full. Default: final-only.
   --track-output-digits N   Intermediate tracking mask digit width. Default: auto.
   --output-digits N         Final mask digit width. Default: auto.
   --downsample-offset N     First interpolated frame to keep. Default: 0.
@@ -640,6 +643,7 @@ parse_args() {
       --tracking-io-workers) TRACKING_IO_WORKERS="${2:?}"; shift 2 ;;
       --tracking-io-queue-depth) TRACKING_IO_QUEUE_DEPTH="${2:?}"; shift 2 ;;
       --tracking-tiff-write-workers) TRACKING_TIFF_WRITE_WORKERS="${2:?}"; shift 2 ;;
+      --tracking-export-mode) TRACKING_EXPORT_MODE="${2:?}"; shift 2 ;;
       --track-output-digits) TRACK_OUTPUT_DIGITS="${2:?}"; shift 2 ;;
       --output-digits) FINAL_OUTPUT_DIGITS="${2:?}"; shift 2 ;;
       --downsample-offset) TEMPORAL_DOWNSAMPLE_OFFSET="${2:?}"; shift 2 ;;
@@ -685,6 +689,13 @@ validate_args() {
   validate_env_options
   [[ -d "$DATASET_ROOT" ]] || die "dataset root does not exist: $DATASET_ROOT"
   [[ -f "$TRACKING_SCRIPT" ]] || die "tracking script does not exist: $TRACKING_SCRIPT"
+  case "$TRACKING_EXPORT_MODE" in
+    final-only|full)
+      ;;
+    *)
+      die "--tracking-export-mode must be final-only or full"
+      ;;
+  esac
 
   if [[ -z "$FILM_CYCLES" ]]; then
     FILM_CYCLES="$(cycles_for_factor "$INTERPOLATION_FACTOR")"
@@ -721,6 +732,11 @@ run_sequence() {
   local tracking_position="${sequence}_interp"
   local tracking_result_dir="$tracking_root/${tracking_position}_RES"
   local final_result_dir="$OUTPUT_ROOT/${sequence}_RES"
+  local effective_tracking_export_mode="$TRACKING_EXPORT_MODE"
+
+  if [[ "$SKIP_DOWNSAMPLE" -eq 1 && "$effective_tracking_export_mode" == "final-only" ]]; then
+    effective_tracking_export_mode="full"
+  fi
 
   [[ -d "$source_dir" ]] || die "missing source image sequence folder: $source_dir"
   prepare_sequence_dirs "$sequence"
@@ -790,8 +806,22 @@ run_sequence() {
       --output-digits "$TRACK_OUTPUT_DIGITS" \
       --io-workers "$TRACKING_IO_WORKERS" \
       --io-queue-depth "$TRACKING_IO_QUEUE_DEPTH" \
-      --tiff-write-workers "$TRACKING_TIFF_WRITE_WORKERS"
+      --tiff-write-workers "$TRACKING_TIFF_WRITE_WORKERS" \
+      --export-mode "$effective_tracking_export_mode"
     )
+    if [[ "$effective_tracking_export_mode" == "final-only" ]]; then
+      tracking_cmd+=(
+        --final-output-dir "$final_result_dir"
+        --source-root "$DATASET_ROOT"
+        --sequence "$sequence"
+        --temporal-downsample-factor "$INTERPOLATION_FACTOR"
+        --temporal-downsample-offset "$TEMPORAL_DOWNSAMPLE_OFFSET"
+        --final-output-digits "$FINAL_OUTPUT_DIGITS"
+      )
+      if [[ "$PAD_MISSING_WITH_EMPTY" -eq 1 ]]; then
+        tracking_cmd+=(--pad-missing-with-empty)
+      fi
+    fi
     if [[ -n "$TRACKING_MMAP_DIR" ]]; then
       tracking_cmd+=(--mmap-dir "$TRACKING_MMAP_DIR")
     fi
@@ -801,20 +831,24 @@ run_sequence() {
   fi
 
   if [[ "$SKIP_DOWNSAMPLE" -eq 0 ]]; then
-    local -a downsample_cmd=(
-      "$PYTHON_BIN" "$SCRIPT_DIR/temporal_downsample_ctc_results.py"
-      --input-result-dir "$tracking_result_dir"
-      --output-result-dir "$final_result_dir"
-      --source-root "$DATASET_ROOT"
-      --sequence "$sequence"
-      --factor "$INTERPOLATION_FACTOR"
-      --offset "$TEMPORAL_DOWNSAMPLE_OFFSET"
-      --output-digits "$FINAL_OUTPUT_DIGITS"
-    )
-    if [[ "$PAD_MISSING_WITH_EMPTY" -eq 1 ]]; then
-      downsample_cmd+=(--pad-missing-with-empty)
+    if [[ "$SKIP_TRACKING" -eq 0 && "$effective_tracking_export_mode" == "final-only" ]]; then
+      log "skip temporal downsample for $sequence; tracking wrote final-only result"
+    else
+      local -a downsample_cmd=(
+        "$PYTHON_BIN" "$SCRIPT_DIR/temporal_downsample_ctc_results.py"
+        --input-result-dir "$tracking_result_dir"
+        --output-result-dir "$final_result_dir"
+        --source-root "$DATASET_ROOT"
+        --sequence "$sequence"
+        --factor "$INTERPOLATION_FACTOR"
+        --offset "$TEMPORAL_DOWNSAMPLE_OFFSET"
+        --output-digits "$FINAL_OUTPUT_DIGITS"
+      )
+      if [[ "$PAD_MISSING_WITH_EMPTY" -eq 1 ]]; then
+        downsample_cmd+=(--pad-missing-with-empty)
+      fi
+      run_cmd "$log_dir/04_temporal_downsample.log" "${downsample_cmd[@]}"
     fi
-    run_cmd "$log_dir/04_temporal_downsample.log" "${downsample_cmd[@]}"
   else
     log "skip temporal downsample for $sequence"
   fi

@@ -20,6 +20,8 @@ from skimage.measure import label, regionprops
 from skimage.morphology import binary_dilation, erosion, opening, skeletonize
 from skimage.transform import resize
 
+from temporal_downsample_ctc_results import temporal_downsample_tracked_stack
+
 
 _MAX_CTC_TRACK_ID = int(np.iinfo(np.uint16).max)
 _TRACKING_DTYPE = np.uint32
@@ -1260,18 +1262,13 @@ def _validate_res_track_rows(final_tracked_tensor: np.ndarray, rows, frame_range
             raise ValueError(f"Track {track_id} has invalid parent ID {parent_id}.")
 
 
-def _write_challenge_outputs(
-    result_dir: Path,
+def _prepare_challenge_tracks(
     final_tracked_tensor: np.ndarray,
-    output_digits: int,
     division_cooldown_frames: int,
     identity_rescue_gap: int = 0,
     rescue_confidence_threshold: float = 0.30,
     max_centroid_dist_px: float = 50.0,
-    tiff_write_workers: int = 4,
 ):
-    result_dir.mkdir(parents=True, exist_ok=True)
-
     if identity_rescue_gap > 0:
         print("[TRACKING] export: normalizing CTC divisions + opt-in identity rescue", flush=True)
     else:
@@ -1291,6 +1288,29 @@ def _write_challenge_outputs(
     print("[TRACKING] export: validating res_track rows", flush=True)
     _validate_res_track_rows(normalized_tensor, rows, frame_ranges)
 
+    final_object_count = max(frame_ranges) if frame_ranges else 0
+    return normalized_tensor, rows, final_object_count
+
+
+def _write_challenge_outputs(
+    result_dir: Path,
+    final_tracked_tensor: np.ndarray,
+    output_digits: int,
+    division_cooldown_frames: int,
+    identity_rescue_gap: int = 0,
+    rescue_confidence_threshold: float = 0.30,
+    max_centroid_dist_px: float = 50.0,
+    tiff_write_workers: int = 4,
+):
+    result_dir.mkdir(parents=True, exist_ok=True)
+    normalized_tensor, rows, final_object_count = _prepare_challenge_tracks(
+        final_tracked_tensor=final_tracked_tensor,
+        division_cooldown_frames=division_cooldown_frames,
+        identity_rescue_gap=identity_rescue_gap,
+        rescue_confidence_threshold=rescue_confidence_threshold,
+        max_centroid_dist_px=max_centroid_dist_px,
+    )
+
     print("[TRACKING] export: writing res_track.txt", flush=True)
     with (result_dir / "res_track.txt").open("w", encoding="utf-8") as f:
         for track_id, begin_frame, end_frame, parent_id in rows:
@@ -1308,7 +1328,6 @@ def _write_challenge_outputs(
     _write_tiff_parallel(result_dir, normalized_tensor, output_digits,
                          n_workers=tiff_write_workers)
 
-    final_object_count = max(frame_ranges) if frame_ranges else 0
     return len(rows), final_object_count
 
 
@@ -1374,6 +1393,15 @@ def run_tracking(
     io_queue_depth: int = 4,
     tiff_write_workers: int = 4,
     mmap_dir: Path | None = None,
+    export_mode: str = "full",
+    final_output_dir: Path | None = None,
+    source_root: Path | None = None,
+    sequence: str | None = None,
+    source_frame_count: int | None = None,
+    temporal_downsample_factor: int = 1,
+    temporal_downsample_offset: int = 0,
+    final_output_digits: str = "auto",
+    pad_missing_with_empty: bool = False,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     if down_factor != 1:
@@ -1382,6 +1410,19 @@ def run_tracking(
         raise ValueError("Challenge export requires resiz_factor=1.0 to preserve original image geometry.")
     if division_cooldown_frames < 0:
         raise ValueError("division_cooldown_frames must be >= 0.")
+    if export_mode not in {"full", "final-only"}:
+        raise ValueError("export_mode must be 'full' or 'final-only'.")
+    if export_mode == "final-only":
+        if final_output_dir is None:
+            raise ValueError("final-only export requires final_output_dir.")
+        if sequence is None:
+            raise ValueError("final-only export requires sequence.")
+        if source_root is None and source_frame_count is None:
+            raise ValueError("final-only export requires source_root or source_frame_count.")
+        if temporal_downsample_factor < 1:
+            raise ValueError("temporal_downsample_factor must be >= 1.")
+        if temporal_downsample_offset < 0:
+            raise ValueError("temporal_downsample_offset must be >= 0.")
 
     result_dir = output_dir / f"{pos}_RES"
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -1409,6 +1450,16 @@ def run_tracking(
         f.write(f"io_queue_depth={io_queue_depth}\n")
         f.write(f"tiff_write_workers={tiff_write_workers}\n")
         f.write(f"mmap_dir={mmap_dir if mmap_dir is not None else 'auto'}\n")
+        f.write(f"export_mode={export_mode}\n")
+        if export_mode == "final-only":
+            f.write(f"final_output_dir={final_output_dir}\n")
+            f.write(f"source_root={source_root if source_root is not None else 'none'}\n")
+            f.write(f"sequence={sequence}\n")
+            f.write(f"source_frame_count={source_frame_count if source_frame_count is not None else 'auto'}\n")
+            f.write(f"temporal_downsample_factor={temporal_downsample_factor}\n")
+            f.write(f"temporal_downsample_offset={temporal_downsample_offset}\n")
+            f.write(f"final_output_digits={final_output_digits}\n")
+            f.write(f"pad_missing_with_empty={int(pad_missing_with_empty)}\n")
         f.write("mask_files:\n")
         for p in files:
             f.write(f"  {p.name}\n")
@@ -1781,16 +1832,51 @@ def run_tracking(
         final_tracked_tensor = mask0
         del tp_im, tp1, track_id_map
 
-        track_count, final_number_objects = _write_challenge_outputs(
-            result_dir=result_dir,
-            final_tracked_tensor=final_tracked_tensor,
-            output_digits=resolved_output_digits,
-            division_cooldown_frames=division_cooldown_frames,
-            identity_rescue_gap=identity_rescue_gap,
-            rescue_confidence_threshold=rescue_confidence_threshold,
-            max_centroid_dist_px=max_centroid_dist_px,
-            tiff_write_workers=tiff_write_workers,
-        )
+        if export_mode == "final-only":
+            normalized_tensor, rows, final_number_objects = _prepare_challenge_tracks(
+                final_tracked_tensor=final_tracked_tensor,
+                division_cooldown_frames=division_cooldown_frames,
+                identity_rescue_gap=identity_rescue_gap,
+                rescue_confidence_threshold=rescue_confidence_threshold,
+                max_centroid_dist_px=max_centroid_dist_px,
+            )
+            print(
+                f"[TRACKING] export: writing final-only downsampled result "
+                f"factor={temporal_downsample_factor} offset={temporal_downsample_offset} "
+                f"output={final_output_dir}",
+                flush=True,
+            )
+            report = temporal_downsample_tracked_stack(
+                tracked_stack=normalized_tensor,
+                input_tracks=rows,
+                output_result_dir=final_output_dir,
+                source_root=source_root,
+                sequence=sequence,
+                source_frame_count=source_frame_count,
+                factor=temporal_downsample_factor,
+                offset=temporal_downsample_offset,
+                output_digits=final_output_digits,
+                pad_missing_with_empty=pad_missing_with_empty,
+            )
+            track_count = int(report["tracks"])
+            final_number_objects = track_count
+            final_number_frames = int(report["frames"])
+            print(
+                f"[TRACKING] export: final-only wrote frames={report['frames']} "
+                f"tracks={report['tracks']} selected={report['selected_first']}..{report['selected_last']}",
+                flush=True,
+            )
+        else:
+            track_count, final_number_objects = _write_challenge_outputs(
+                result_dir=result_dir,
+                final_tracked_tensor=final_tracked_tensor,
+                output_digits=resolved_output_digits,
+                division_cooldown_frames=division_cooldown_frames,
+                identity_rescue_gap=identity_rescue_gap,
+                rescue_confidence_threshold=rescue_confidence_threshold,
+                max_centroid_dist_px=max_centroid_dist_px,
+                tiff_write_workers=tiff_write_workers,
+            )
 
         print(
             f"[TRACKING] END final_objects={final_number_objects} "
@@ -1937,6 +2023,56 @@ def parse_args():
             "Set this to a fast local SSD folder when processing masks from a network share."
         ),
     )
+    parser.add_argument(
+        "--export-mode",
+        choices=["full", "final-only"],
+        default="full",
+        help=(
+            "full writes every tracked interpolated mask; final-only writes only the temporally "
+            "downsampled CTC result."
+        ),
+    )
+    parser.add_argument(
+        "--final-output-dir",
+        default=None,
+        type=Path,
+        help="Destination CTC result folder for --export-mode final-only.",
+    )
+    parser.add_argument(
+        "--source-root",
+        default=None,
+        type=Path,
+        help="Original CTC dataset root used to infer final frame indices for final-only export.",
+    )
+    parser.add_argument("--sequence", default=None, type=str, help="Sequence ID for final-only export, e.g. 01.")
+    parser.add_argument(
+        "--source-frame-count",
+        default=None,
+        type=int,
+        help="Final timeline frame count for final-only export when source-root is unavailable.",
+    )
+    parser.add_argument(
+        "--temporal-downsample-factor",
+        default=1,
+        type=int,
+        help="Interpolated-frame factor used by final-only export (default: 1).",
+    )
+    parser.add_argument(
+        "--temporal-downsample-offset",
+        default=0,
+        type=int,
+        help="First tracked frame selected by final-only export (default: 0).",
+    )
+    parser.add_argument(
+        "--final-output-digits",
+        default="auto",
+        help="Digits used for final-only CTC mask names: auto or a positive integer (default: auto).",
+    )
+    parser.add_argument(
+        "--pad-missing-with-empty",
+        action="store_true",
+        help="For final-only export, write blank masks for selected frames missing from the tracked stack.",
+    )
     return parser.parse_args()
 
 
@@ -1951,6 +2087,8 @@ def main():
         else script_dir / f"output_{time.strftime('%Y%m%d_%H%M%S')}"
     ).resolve()
     mmap_dir = args.mmap_dir.expanduser().resolve() if args.mmap_dir is not None else None
+    final_output_dir = args.final_output_dir.resolve() if args.final_output_dir is not None else None
+    source_root = args.source_root.resolve() if args.source_root is not None else None
 
     if not mask_dir.exists() or not mask_dir.is_dir():
         raise NotADirectoryError(
@@ -1978,6 +2116,15 @@ def main():
         io_queue_depth=args.io_queue_depth,
         tiff_write_workers=args.tiff_write_workers,
         mmap_dir=mmap_dir,
+        export_mode=args.export_mode,
+        final_output_dir=final_output_dir,
+        source_root=source_root,
+        sequence=args.sequence,
+        source_frame_count=args.source_frame_count,
+        temporal_downsample_factor=args.temporal_downsample_factor,
+        temporal_downsample_offset=args.temporal_downsample_offset,
+        final_output_digits=args.final_output_digits,
+        pad_missing_with_empty=args.pad_missing_with_empty,
     )
 
 

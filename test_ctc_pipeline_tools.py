@@ -26,7 +26,7 @@ from ram_run_tiptracking_standalone_optimized import (
     _split_discontinuous_tracks as _split_discontinuous_tracks_ram,
 )
 from rescale_image_mask_pairs import rescale_dataset, resize_mask_array
-from temporal_downsample_ctc_results import temporal_downsample_ctc_results
+from temporal_downsample_ctc_results import temporal_downsample_ctc_results, temporal_downsample_tracked_stack
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
 from visualize_rescale_overlay import export_rescale_overlay_comparisons
 from view_tracking_overlay import (
@@ -507,6 +507,59 @@ class CTCPipelineToolTests(unittest.TestCase):
             )
             self.assertEqual(validation["frames"], 3)
             self.assertEqual(validation["tracks"], 2)
+
+    def test_temporal_downsample_tracked_stack_matches_file_downsample_factor_8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            input_dir = root / "01_interp_RES"
+            file_output_dir = root / "eval_file" / "01_RES"
+            stack_output_dir = root / "eval_stack" / "01_RES"
+            self._write_source_frames(source, "01", frame_count=3)
+            input_dir.mkdir()
+
+            stack = np.zeros((6, 6, 17), dtype=np.uint16)
+            stack[1:3, 1:3, 0] = 7
+            stack[3:5, 3:5, 8] = 13
+            stack[3:5, 3:5, 16] = 13
+            for frame_idx in [0, 8, 16]:
+                tifffile.imwrite(input_dir / f"mask{frame_idx:03d}.tif", stack[:, :, frame_idx])
+            input_tracks = [(7, 0, 0, 0), (13, 8, 16, 7)]
+            (input_dir / "res_track.txt").write_text("7 0 0 0\n13 8 16 7\n", encoding="utf-8")
+
+            file_report = temporal_downsample_ctc_results(
+                input_result_dir=input_dir,
+                output_result_dir=file_output_dir,
+                source_root=source,
+                sequence="01",
+                factor=8,
+                offset=0,
+            )
+            stack_report = temporal_downsample_tracked_stack(
+                tracked_stack=stack,
+                input_tracks=input_tracks,
+                output_result_dir=stack_output_dir,
+                source_root=source,
+                sequence="01",
+                factor=8,
+                offset=0,
+            )
+
+            self.assertEqual(stack_report["frames"], file_report["frames"])
+            self.assertEqual(stack_report["tracks"], file_report["tracks"])
+            self.assertEqual(
+                (stack_output_dir / "res_track.txt").read_text(encoding="utf-8"),
+                "1 0 0 0\n2 1 2 1\n",
+            )
+            self.assertEqual(
+                (stack_output_dir / "res_track.txt").read_text(encoding="utf-8"),
+                (file_output_dir / "res_track.txt").read_text(encoding="utf-8"),
+            )
+            for path in sorted(file_output_dir.glob("mask*.tif")):
+                np.testing.assert_array_equal(
+                    tifffile.imread(stack_output_dir / path.name),
+                    tifffile.imread(path),
+                )
 
     def test_temporal_downsample_preserves_nonzero_source_frame_indices(self):
         with tempfile.TemporaryDirectory() as tmp:

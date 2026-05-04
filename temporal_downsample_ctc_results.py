@@ -259,6 +259,28 @@ def _scan_sampled_label_frames(selected_mask_files: list[Path | None], output_fr
     return label_frames, reference_shape
 
 
+def _scan_sampled_label_arrays(selected_masks: list[np.ndarray | None], output_frame_indices: list[int]):
+    label_frames: dict[int, list[int]] = {}
+    reference_shape = None
+
+    for output_frame_idx, mask in zip(output_frame_indices, selected_masks):
+        if mask is None:
+            continue
+        mask = np.asarray(mask)
+        mask_shape = tuple(mask.shape)
+        if reference_shape is None:
+            reference_shape = mask_shape
+        elif mask_shape != reference_shape:
+            raise ValueError(f"Sampled mask shape {mask_shape} differs from first mask shape {reference_shape}.")
+
+        labels = np.unique(mask)
+        labels = labels[labels != 0].astype(int, copy=False)
+        for label in labels.tolist():
+            label_frames.setdefault(label, []).append(output_frame_idx)
+
+    return label_frames, reference_shape
+
+
 def _build_output_tracks(
     label_frames: dict[int, list[int]],
     input_rows: dict[int, InputTrackRow],
@@ -329,6 +351,161 @@ def _relabel_mask(mask: np.ndarray, label_map: dict[int, int]):
     return relabeled
 
 
+def _normalize_input_tracks(input_tracks):
+    rows: dict[int, InputTrackRow] = {}
+    raw_rows = input_tracks.values() if isinstance(input_tracks, dict) else input_tracks
+    for raw_row in raw_rows:
+        if isinstance(raw_row, InputTrackRow):
+            row = raw_row
+        else:
+            try:
+                label, begin, end, parent = raw_row
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Input track rows must contain four integer columns: L B E P") from exc
+            row = InputTrackRow(
+                label=int(label),
+                begin=int(begin),
+                end=int(end),
+                parent=int(parent),
+            )
+        rows[row.label] = row
+    return rows
+
+
+def _resolve_downsample_timeline(
+    source_root: Path | None,
+    sequence: str,
+    source_frame_count: int | None,
+    target_shape: tuple[int, int] | None,
+    output_digits: str,
+):
+    if source_frame_count is None:
+        output_frame_indices, source_digits = _source_frame_indices_and_digits(source_root, sequence)
+    else:
+        output_frame_indices = list(range(source_frame_count))
+        source_digits = None
+    expected_frame_count = len(output_frame_indices)
+    if target_shape is None and source_root is not None:
+        try:
+            target_shape = _target_shape_from_gt(source_root, sequence)
+        except FileNotFoundError:
+            target_shape = None
+    resolved_output_digits = _resolve_output_digits(output_digits, expected_frame_count, source_digits)
+    return output_frame_indices, target_shape, resolved_output_digits
+
+
+def _validate_downsample_inputs(
+    factor: int,
+    offset: int,
+    source_root: Path | None,
+    source_frame_count: int | None,
+):
+    if factor < 1:
+        raise ValueError("--factor must be >= 1.")
+    if offset < 0:
+        raise ValueError("--offset must be >= 0.")
+    if source_frame_count is not None and source_frame_count < 1:
+        raise ValueError("--source-frame-count must be a positive integer.")
+    if source_root is None and source_frame_count is None:
+        raise ValueError("Provide either --source-root or --source-frame-count.")
+    if source_root is not None and not source_root.is_dir():
+        raise NotADirectoryError(f"source-root does not exist: {source_root}")
+
+
+def temporal_downsample_tracked_stack(
+    tracked_stack: np.ndarray,
+    input_tracks,
+    output_result_dir: Path,
+    source_root: Path | None,
+    sequence: str,
+    source_frame_count: int | None = None,
+    target_shape: tuple[int, int] | None = None,
+    pad_missing_with_empty: bool = False,
+    factor: int = 16,
+    offset: int = 0,
+    output_digits: str = "auto",
+):
+    output_result_dir = output_result_dir.resolve()
+    source_root = source_root.resolve() if source_root is not None else None
+    sequence = _normalize_sequence(sequence)
+    tracked_stack = np.asarray(tracked_stack)
+    if tracked_stack.ndim != 3:
+        raise ValueError(f"tracked_stack must have shape HEIGHT,WIDTH,FRAMES; got {tracked_stack.shape}.")
+
+    _validate_downsample_inputs(factor, offset, source_root, source_frame_count)
+    output_frame_indices, target_shape, resolved_output_digits = _resolve_downsample_timeline(
+        source_root=source_root,
+        sequence=sequence,
+        source_frame_count=source_frame_count,
+        target_shape=target_shape,
+        output_digits=output_digits,
+    )
+    expected_frame_count = len(output_frame_indices)
+    input_frame_count = int(tracked_stack.shape[2])
+    selected_input_indices = [offset + output_idx * factor for output_idx in range(expected_frame_count)]
+    missing = [index for index in selected_input_indices if index < 0 or index >= input_frame_count]
+    missing_set = set(missing)
+    if missing:
+        preview = ", ".join(str(index) for index in missing[:20])
+        if not pad_missing_with_empty:
+            raise ValueError(
+                f"Tracked stack does not contain all selected frames for factor={factor}, offset={offset}. "
+                f"Missing input mask indices: {preview}. Pass --pad-missing-with-empty to write blank "
+                "prediction masks for unavailable frames."
+            )
+        print(
+            "[TEMPORAL DOWNSAMPLE] warning: "
+            f"padding {len(missing)} missing selected frame(s) with empty masks; first missing: {preview}",
+            flush=True,
+        )
+
+    selected_masks = [
+        None if index in missing_set else tracked_stack[:, :, index]
+        for index in selected_input_indices
+    ]
+    blank_shape = target_shape or tuple(tracked_stack.shape[:2])
+    label_frames, reference_shape = _scan_sampled_label_arrays(selected_masks, output_frame_indices)
+    input_rows = _normalize_input_tracks(input_tracks)
+    output_rows = _build_output_tracks(label_frames, input_rows)
+    frame_label_maps = _build_frame_label_maps(output_rows, output_frame_indices)
+
+    _clear_ctc_outputs(output_result_dir)
+    for output_frame_idx, mask in zip(output_frame_indices, selected_masks):
+        if mask is None:
+            mask = np.zeros(blank_shape, dtype=np.uint16)
+        else:
+            mask = np.asarray(mask)
+        relabeled = _relabel_mask(mask, frame_label_maps[output_frame_idx])
+        if target_shape is not None:
+            relabeled = _resize_label_mask_to_shape(relabeled, target_shape)
+        tifffile.imwrite(
+            str(output_result_dir / f"mask{output_frame_idx:0{resolved_output_digits}d}.tif"),
+            relabeled,
+        )
+
+    with (output_result_dir / "res_track.txt").open("w", encoding="utf-8") as handle:
+        for row in output_rows:
+            handle.write(f"{row.label} {row.begin} {row.end} {row.parent}\n")
+
+    return {
+        "sequence": sequence,
+        "frames": expected_frame_count,
+        "tracks": len(output_rows),
+        "digits": resolved_output_digits,
+        "factor": factor,
+        "offset": offset,
+        "input_result_dir": None,
+        "output_result_dir": output_result_dir,
+        "selected_first": selected_input_indices[0] if selected_input_indices else None,
+        "selected_last": selected_input_indices[-1] if selected_input_indices else None,
+        "output_first": output_frame_indices[0] if output_frame_indices else None,
+        "output_last": output_frame_indices[-1] if output_frame_indices else None,
+        "missing_selected_frames": len(missing),
+        "shape": reference_shape,
+        "target_shape": target_shape,
+    }
+
+
 def temporal_downsample_ctc_results(
     input_result_dir: Path,
     output_result_dir: Path,
@@ -346,33 +523,19 @@ def temporal_downsample_ctc_results(
     source_root = source_root.resolve() if source_root is not None else None
     sequence = _normalize_sequence(sequence)
 
-    if factor < 1:
-        raise ValueError("--factor must be >= 1.")
-    if offset < 0:
-        raise ValueError("--offset must be >= 0.")
-    if source_frame_count is not None and source_frame_count < 1:
-        raise ValueError("--source-frame-count must be a positive integer.")
     if input_result_dir == output_result_dir:
         raise ValueError("input-result-dir and output-result-dir must be different directories.")
     if not input_result_dir.is_dir():
         raise NotADirectoryError(f"input-result-dir does not exist: {input_result_dir}")
-    if source_root is None and source_frame_count is None:
-        raise ValueError("Provide either --source-root or --source-frame-count.")
-    if source_root is not None and not source_root.is_dir():
-        raise NotADirectoryError(f"source-root does not exist: {source_root}")
-
-    if source_frame_count is None:
-        output_frame_indices, source_digits = _source_frame_indices_and_digits(source_root, sequence)
-    else:
-        output_frame_indices = list(range(source_frame_count))
-        source_digits = None
+    _validate_downsample_inputs(factor, offset, source_root, source_frame_count)
+    output_frame_indices, target_shape, resolved_output_digits = _resolve_downsample_timeline(
+        source_root=source_root,
+        sequence=sequence,
+        source_frame_count=source_frame_count,
+        target_shape=target_shape,
+        output_digits=output_digits,
+    )
     expected_frame_count = len(output_frame_indices)
-    if target_shape is None and source_root is not None:
-        try:
-            target_shape = _target_shape_from_gt(source_root, sequence)
-        except FileNotFoundError:
-            target_shape = None
-    resolved_output_digits = _resolve_output_digits(output_digits, expected_frame_count, source_digits)
 
     input_masks, _ = _indexed_files(input_result_dir, "mask")
     if not input_masks:
