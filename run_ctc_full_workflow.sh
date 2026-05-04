@@ -39,6 +39,10 @@ CELLPOSE_EXTRA_ARGS=()
 
 TRACKING_SCRIPT="$SCRIPT_DIR/ram_run_tiptracking_standalone_optimized.py"
 TIME_SERIES_THRESHOLD=1
+TRACKING_MMAP_DIR=""
+TRACKING_IO_WORKERS=1
+TRACKING_IO_QUEUE_DEPTH=4
+TRACKING_TIFF_WRITE_WORKERS=4
 TRACK_OUTPUT_DIGITS="auto"
 FINAL_OUTPUT_DIGITS="auto"
 TEMPORAL_DOWNSAMPLE_OFFSET=0
@@ -106,6 +110,12 @@ Cellpose options:
 Tracking/downsampling options:
   --tracking-script PATH    Tracking runner. Default: ram_run_tiptracking_standalone_optimized.py.
   --time-series-threshold N Tracking time-series threshold. Default: 1.
+  --tracking-mmap-dir PATH  Temporary tracking stack scratch directory.
+  --tracking-io-workers N   Background TIFF read threads for tracking. Default: 1.
+  --tracking-io-queue-depth N
+                            Decoded mask prefetch queue depth for tracking. Default: 4.
+  --tracking-tiff-write-workers N
+                            TIFF output write threads for tracking. Default: 4.
   --track-output-digits N   Intermediate tracking mask digit width. Default: auto.
   --output-digits N         Final mask digit width. Default: auto.
   --downsample-offset N     First interpolated frame to keep. Default: 0.
@@ -626,6 +636,10 @@ parse_args() {
       --cellpose-extra-arg) CELLPOSE_EXTRA_ARGS+=("${2:?}"); shift 2 ;;
       --tracking-script) TRACKING_SCRIPT="${2:?}"; shift 2 ;;
       --time-series-threshold) TIME_SERIES_THRESHOLD="${2:?}"; shift 2 ;;
+      --tracking-mmap-dir) TRACKING_MMAP_DIR="$(path_arg "${2:?}")"; shift 2 ;;
+      --tracking-io-workers) TRACKING_IO_WORKERS="${2:?}"; shift 2 ;;
+      --tracking-io-queue-depth) TRACKING_IO_QUEUE_DEPTH="${2:?}"; shift 2 ;;
+      --tracking-tiff-write-workers) TRACKING_TIFF_WRITE_WORKERS="${2:?}"; shift 2 ;;
       --track-output-digits) TRACK_OUTPUT_DIGITS="${2:?}"; shift 2 ;;
       --output-digits) FINAL_OUTPUT_DIGITS="${2:?}"; shift 2 ;;
       --downsample-offset) TEMPORAL_DOWNSAMPLE_OFFSET="${2:?}"; shift 2 ;;
@@ -766,14 +780,22 @@ run_sequence() {
     local mask_dir
     mask_dir="$(resolve_mask_dir "$interpolated_dir" "$CELLPOSE_MASK_DIR")"
     log "segmentation masks: $mask_dir pattern=$SEG_MASK_PATTERN"
-    run_cmd "$log_dir/03_tracking.log" \
+    local -a tracking_cmd=(
       "$PYTHON_BIN" "$TRACKING_SCRIPT" \
       --mask-dir "$mask_dir" \
       --mask-pattern "$SEG_MASK_PATTERN" \
       --output-dir "$tracking_root" \
       --position "$tracking_position" \
       --time-series-threshold "$TIME_SERIES_THRESHOLD" \
-      --output-digits "$TRACK_OUTPUT_DIGITS"
+      --output-digits "$TRACK_OUTPUT_DIGITS" \
+      --io-workers "$TRACKING_IO_WORKERS" \
+      --io-queue-depth "$TRACKING_IO_QUEUE_DEPTH" \
+      --tiff-write-workers "$TRACKING_TIFF_WRITE_WORKERS"
+    )
+    if [[ -n "$TRACKING_MMAP_DIR" ]]; then
+      tracking_cmd+=(--mmap-dir "$TRACKING_MMAP_DIR")
+    fi
+    run_cmd "$log_dir/03_tracking.log" "${tracking_cmd[@]}"
   else
     log "skip tracking for $sequence"
   fi

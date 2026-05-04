@@ -26,6 +26,9 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         self.assertIn("--film-model", result.stdout)
         self.assertIn("--cellpose-model", result.stdout)
         self.assertIn("--output-root", result.stdout)
+        self.assertIn("--tracking-mmap-dir", result.stdout)
+        self.assertIn("--tracking-io-workers", result.stdout)
+        self.assertIn("--tracking-tiff-write-workers", result.stdout)
 
     def test_help_documents_environment_bootstrap_options(self):
         result = subprocess.run(
@@ -160,6 +163,56 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stdout)
             self.assertIn("interpolate_between_series_rapid.py", result.stdout)
             self.assertNotIn("--model_path", result.stdout)
+
+    def test_dry_run_forwards_tracking_performance_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = root / "BF-C2DL-HSC"
+            work_root = root / "work"
+            output_root = root / "submission"
+            cellpose_model = root / "cellpose_model"
+            mmap_dir = root / "mmap"
+            for folder in [dataset_root / "02", cellpose_model, mmap_dir]:
+                folder.mkdir(parents=True)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT),
+                    "--dataset-root",
+                    str(dataset_root),
+                    "--work-root",
+                    str(work_root),
+                    "--output-root",
+                    str(output_root),
+                    "--cellpose-model",
+                    str(cellpose_model),
+                    "--sequences",
+                    "02",
+                    "--stage-gt",
+                    "none",
+                    "--skip-validation",
+                    "--tracking-mmap-dir",
+                    str(mmap_dir),
+                    "--tracking-io-workers",
+                    "4",
+                    "--tracking-io-queue-depth",
+                    "16",
+                    "--tracking-tiff-write-workers",
+                    "8",
+                    "--dry-run",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stdout)
+            self.assertIn(f"--mmap-dir {shlex.quote(str(mmap_dir))}", result.stdout)
+            self.assertIn("--io-workers 4", result.stdout)
+            self.assertIn("--io-queue-depth 16", result.stdout)
+            self.assertIn("--tiff-write-workers 8", result.stdout)
 
     def test_missing_cellpose_module_fails_before_interpolation(self):
         with tempfile.TemporaryDirectory() as tmp:
