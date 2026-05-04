@@ -1778,61 +1778,16 @@ def run_tracking(
                 flush=True,
             )
 
-        print("[TRACKING] post: preparing downsampled mask stack", flush=True)
         dz = int(mask0.shape[2])
-        max_id = raw_track_count
-        numb_m1 = int(mask0.shape[2])
-        if max_id > 0:
-            print(f"[TRACKING] post: building temporal presence table for {numb_m1} frames", flush=True)
-            # OPT-4: consolidated tp_im builder
-            tp_im = _build_tp_im(mask0, max_id)
-        else:
-            tp_im = np.zeros((0, numb_m1), dtype=np.uint32)
-
-        tp1 = tp_im != 0
-
-        object_count = int(np.count_nonzero(np.any(tp_im != 0, axis=1)))
-        print(f"[TRACKING] post: resolving discontinuous tracks across {object_count} objects", flush=True)
-        tp_im, tp1, pruned_short_fragments, pruned_capacity_fragments = _split_discontinuous_tracks(
-            mask_stack=mask0,
-            tp_im=tp_im,
-            tp1=tp1,
-            time_series_threshold=time_series_threshold,
-        )
-        if pruned_short_fragments > 0:
-            print(
-                f"[TRACKING] post: pruned {pruned_short_fragments} disconnected fragments "
-                f"shorter than time-series-threshold={time_series_threshold}",
-                flush=True,
-            )
-        if pruned_capacity_fragments > 0:
-            print(
-                f"[TRACKING] post: pruned {pruned_capacity_fragments} disconnected fragments "
-                f"after reaching the uint16 CTC label limit ({_MAX_CTC_TRACK_ID}); "
-                "increase --time-series-threshold to prefer longer surviving tracks",
-                flush=True,
-            )
-
-        obj_cor = (np.where(np.sum(tp1, axis=1) >= time_series_threshold)[0] + 1).astype(int)
-        no_obj = int(len(obj_cor))
-        if no_obj > np.iinfo(np.uint16).max:
-            raise ValueError("Track count exceeds uint16 capacity required for challenge mask export.")
-
-        print(f"[TRACKING] post: compacting surviving tracks to {no_obj} objects", flush=True)
-        track_id_map = np.zeros(tp_im.shape[0] + 1, dtype=np.uint16)
-        for seq_id, raw_id in enumerate(obj_cor, start=1):
-            track_id_map[raw_id] = seq_id
-
-        # OPT-8: single LUT remap replaces F × len(obj_cor) individual scans
-        if numb_m1 % 250 == 0 or numb_m1 > 0:
-            print(f"[TRACKING] post remap {numb_m1} frames via LUT", flush=True)
-        _remap_stack_with_lut(mask0, track_id_map)
-
-        final_number_frames = int(mask0.shape[2])
-        final_tracked_tensor = mask0
-        del tp_im, tp1, track_id_map
+        final_number_frames = dz
 
         if export_mode == "final-only":
+            final_tracked_tensor = mask0
+            print(
+                "[TRACKING] post: final-only export skips full interpolated "
+                "discontinuity splitting; sampled frames are relabelled during downsample",
+                flush=True,
+            )
             normalized_tensor, rows, final_number_objects = _prepare_challenge_tracks(
                 final_tracked_tensor=final_tracked_tensor,
                 division_cooldown_frames=division_cooldown_frames,
@@ -1867,6 +1822,59 @@ def run_tracking(
                 flush=True,
             )
         else:
+            print("[TRACKING] post: preparing downsampled mask stack", flush=True)
+            max_id = raw_track_count
+            numb_m1 = int(mask0.shape[2])
+            if max_id > 0:
+                print(f"[TRACKING] post: building temporal presence table for {numb_m1} frames", flush=True)
+                # OPT-4: consolidated tp_im builder
+                tp_im = _build_tp_im(mask0, max_id)
+            else:
+                tp_im = np.zeros((0, numb_m1), dtype=np.uint32)
+
+            tp1 = tp_im != 0
+
+            object_count = int(np.count_nonzero(np.any(tp_im != 0, axis=1)))
+            print(f"[TRACKING] post: resolving discontinuous tracks across {object_count} objects", flush=True)
+            tp_im, tp1, pruned_short_fragments, pruned_capacity_fragments = _split_discontinuous_tracks(
+                mask_stack=mask0,
+                tp_im=tp_im,
+                tp1=tp1,
+                time_series_threshold=time_series_threshold,
+            )
+            if pruned_short_fragments > 0:
+                print(
+                    f"[TRACKING] post: pruned {pruned_short_fragments} disconnected fragments "
+                    f"shorter than time-series-threshold={time_series_threshold}",
+                    flush=True,
+                )
+            if pruned_capacity_fragments > 0:
+                print(
+                    f"[TRACKING] post: pruned {pruned_capacity_fragments} disconnected fragments "
+                    f"after reaching the uint16 CTC label limit ({_MAX_CTC_TRACK_ID}); "
+                    "increase --time-series-threshold to prefer longer surviving tracks",
+                    flush=True,
+                )
+
+            obj_cor = (np.where(np.sum(tp1, axis=1) >= time_series_threshold)[0] + 1).astype(int)
+            no_obj = int(len(obj_cor))
+            if no_obj > np.iinfo(np.uint16).max:
+                raise ValueError("Track count exceeds uint16 capacity required for challenge mask export.")
+
+            print(f"[TRACKING] post: compacting surviving tracks to {no_obj} objects", flush=True)
+            track_id_map = np.zeros(tp_im.shape[0] + 1, dtype=np.uint16)
+            for seq_id, raw_id in enumerate(obj_cor, start=1):
+                track_id_map[raw_id] = seq_id
+
+            # OPT-8: single LUT remap replaces F x len(obj_cor) individual scans
+            if numb_m1 % 250 == 0 or numb_m1 > 0:
+                print(f"[TRACKING] post remap {numb_m1} frames via LUT", flush=True)
+            _remap_stack_with_lut(mask0, track_id_map)
+
+            final_number_frames = int(mask0.shape[2])
+            final_tracked_tensor = mask0
+            del tp_im, tp1, track_id_map
+
             track_count, final_number_objects = _write_challenge_outputs(
                 result_dir=result_dir,
                 final_tracked_tensor=final_tracked_tensor,
