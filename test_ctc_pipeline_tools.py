@@ -21,12 +21,13 @@ from run_tiptracking_standalone import (
 from ram_run_tiptracking_standalone_optimized import (
     _choose_mmap_dir,
     _compact_labels_in_place_fast,
+    _labels_are_dense_prefix,
     _looks_like_network_path,
     _normalize_ctc_divisions as _normalize_ctc_divisions_ram,
     _split_discontinuous_tracks as _split_discontinuous_tracks_ram,
 )
 from rescale_image_mask_pairs import rescale_dataset, resize_mask_array
-from temporal_downsample_ctc_results import temporal_downsample_ctc_results, temporal_downsample_tracked_stack
+from temporal_downsample_ctc_results import _relabel_mask, temporal_downsample_ctc_results, temporal_downsample_tracked_stack
 from validate_ctc_result_format import ValidationError, validate_ctc_result_format
 from visualize_rescale_overlay import export_rescale_overlay_comparisons
 from view_tracking_overlay import (
@@ -176,6 +177,34 @@ class CTCPipelineToolTests(unittest.TestCase):
         self.assertEqual(ram_result, standalone_result)
         np.testing.assert_array_equal(ram_stack, standalone_stack)
 
+    def test_ram_fast_compaction_preserves_dense_raw_ids(self):
+        mask_stack = np.zeros((2, 3, 2), dtype=np.uint32)
+        mask_stack[:, :, 0] = np.array([[0, 1, 2], [3, 0, 0]], dtype=np.uint32)
+        mask_stack[:, :, 1] = np.array([[3, 2, 0], [0, 1, 0]], dtype=np.uint32)
+        expected = mask_stack.copy()
+
+        result = _compact_labels_in_place_fast(mask_stack)
+
+        self.assertEqual(result, (3, 3))
+        np.testing.assert_array_equal(mask_stack, expected)
+
+    def test_dense_prefix_detection_requires_all_prior_ids(self):
+        dense_frame = np.array([[0, 1, 2], [3, 0, 0]], dtype=np.uint32)
+        sparse_frame = np.array([[0, 1, 3], [0, 0, 0]], dtype=np.uint32)
+
+        self.assertTrue(_labels_are_dense_prefix(dense_frame, 3))
+        self.assertFalse(_labels_are_dense_prefix(sparse_frame, 3))
+
+    def test_downsample_relabel_mask_uses_zero_for_unmapped_labels(self):
+        mask = np.array([[0, 7, 99], [42, 99, 7]], dtype=np.uint32)
+
+        relabeled = _relabel_mask(mask, {7: 1, 42: 2})
+
+        np.testing.assert_array_equal(
+            relabeled,
+            np.array([[0, 1, 0], [2, 0, 1]], dtype=np.uint16),
+        )
+
     def _division_stack(self, frame_count=3):
         stack = np.zeros((12, 12, frame_count), dtype=np.uint16)
         stack[2:8, 2:8, 0] = 1
@@ -300,6 +329,31 @@ class CTCPipelineToolTests(unittest.TestCase):
         stack[5:8, 2:8, 2] = 4
 
         self._assert_ram_normalize_matches_standalone(stack, division_cooldown_frames=20)
+
+    def test_ram_normalize_ctc_divisions_matches_standalone_at_image_border(self):
+        stack = np.zeros((12, 12, 3), dtype=np.uint16)
+        stack[0:6, 0:6, 0] = 1
+        stack[0:3, 0:6, 1:] = 1
+        stack[3:6, 0:6, 1:] = 2
+        stack[8:11, 8:11, :] = 3
+
+        self._assert_ram_normalize_matches_standalone(stack, division_cooldown_frames=20)
+
+    def test_ram_normalize_ctc_divisions_matches_standalone_randomized_stress(self):
+        rng = np.random.default_rng(20260505)
+        for _ in range(30):
+            stack = np.zeros((18, 19, 5), dtype=np.uint16)
+            for frame_idx in range(stack.shape[2]):
+                for label_id in range(1, 8):
+                    if rng.random() < 0.25:
+                        continue
+                    height = int(rng.integers(2, 6))
+                    width = int(rng.integers(2, 6))
+                    row = int(rng.integers(0, stack.shape[0] - height + 1))
+                    col = int(rng.integers(0, stack.shape[1] - width + 1))
+                    stack[row : row + height, col : col + width, frame_idx] = label_id
+
+            self._assert_ram_normalize_matches_standalone(stack, division_cooldown_frames=3)
 
     def test_division_cooldown_rescues_daughter_label_swap(self):
         stack = self._division_stack(frame_count=3)

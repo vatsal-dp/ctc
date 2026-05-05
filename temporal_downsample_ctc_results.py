@@ -345,7 +345,20 @@ def _clear_ctc_outputs(output_result_dir: Path):
 
 
 def _relabel_mask(mask: np.ndarray, label_map: dict[int, int]):
+    mask = np.asarray(mask)
     relabeled = np.zeros(mask.shape, dtype=np.uint16)
+    if not label_map or mask.size == 0:
+        return relabeled
+
+    max_mask_label = int(mask.max())
+    max_map_label = max(int(label) for label in label_map)
+    max_label = max(max_mask_label, max_map_label)
+    if max_label <= 10_000_000:
+        lut = np.zeros(max_label + 1, dtype=np.uint16)
+        for old_label, new_label in label_map.items():
+            lut[int(old_label)] = int(new_label)
+        return lut[mask.astype(np.intp, copy=False)]
+
     for old_label, new_label in label_map.items():
         relabeled[mask == old_label] = new_label
     return relabeled

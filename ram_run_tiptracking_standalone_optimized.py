@@ -14,7 +14,8 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
-from scipy.ndimage import convolve, rotate
+from scipy.ndimage import binary_dilation as ndi_binary_dilation
+from scipy.ndimage import convolve, find_objects, rotate
 from scipy.stats import mode
 from skimage.measure import label, regionprops
 from skimage.morphology import binary_dilation, erosion, opening, skeletonize
@@ -25,6 +26,7 @@ from temporal_downsample_ctc_results import temporal_downsample_tracked_stack
 
 _MAX_CTC_TRACK_ID = int(np.iinfo(np.uint16).max)
 _TRACKING_DTYPE = np.uint32
+_STRUCTURE_3X3_BOOL = np.ones((3, 3), dtype=bool)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +166,9 @@ def _compact_labels_in_place_fast(mask_stack: np.ndarray) -> tuple[int, int]:
 
     max_label_before = int(labels[-1])
 
+    if labels.size == max_label_before and int(labels[0]) == 1:
+        return int(labels.size), max_label_before
+
     # Build LUT: old_id → new_id (0 stays 0)
     lut = np.zeros(max_label_before + 1, dtype=mask_stack.dtype)
     for new_id, old_id in enumerate(labels, start=1):
@@ -174,11 +179,18 @@ def _compact_labels_in_place_fast(mask_stack: np.ndarray) -> tuple[int, int]:
         frame = mask_stack[:, :, frame_idx]
         if not np.any(frame):
             continue
-        # Clip to LUT bounds (guard against any stray IDs above max_label_before)
-        clipped = np.clip(frame, 0, max_label_before)
-        mask_stack[:, :, frame_idx] = lut[clipped]
+        nonzero = frame != 0
+        frame[nonzero] = lut[frame[nonzero]]
 
     return int(labels.size), max_label_before
+
+
+def _labels_are_dense_prefix(frame: np.ndarray, max_label: int) -> bool:
+    if max_label <= 0:
+        return not np.any(frame)
+    labels = np.unique(frame)
+    labels = labels[labels != 0]
+    return bool(labels.size == max_label and int(labels[0]) == 1 and int(labels[-1]) == max_label)
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +534,122 @@ def _track_ids_in_frame(frame: np.ndarray):
     return ids[ids != 0].astype(int)
 
 
+# These helpers preserve the full-frame 3x3 contact tests used for CTC
+# division normalization, but run morphology only inside each label's padded
+# bounding box instead of once per label over the entire frame.
+def _frame_label_stats(frame: np.ndarray):
+    counts = np.bincount(frame.ravel())
+    max_label = int(len(counts) - 1)
+    label_slices = find_objects(frame, max_label=max_label) if max_label > 0 else []
+    return counts, label_slices
+
+
+def _track_ids_from_counts(counts: np.ndarray):
+    return np.flatnonzero(counts[1:]).astype(int) + 1
+
+
+def _label_count(counts: np.ndarray, track_id: int) -> int:
+    return int(counts[track_id]) if 0 <= track_id < len(counts) else 0
+
+
+def _label_slice(label_slices, track_id: int):
+    index = int(track_id) - 1
+    if index < 0 or index >= len(label_slices):
+        return None
+    return label_slices[index]
+
+
+def _expanded_slice(label_slice, shape: tuple[int, int], pad: int = 1):
+    row_slice, col_slice = label_slice
+    return (
+        slice(max(0, row_slice.start - pad), min(shape[0], row_slice.stop + pad)),
+        slice(max(0, col_slice.start - pad), min(shape[1], col_slice.stop + pad)),
+    )
+
+
+def _has_self_continuity_local(
+    prev_frame: np.ndarray,
+    curr_frame: np.ndarray,
+    track_id: int,
+    prev_counts: np.ndarray,
+    curr_counts: np.ndarray,
+    prev_slices,
+    curr_slices,
+    min_touch_pixels: int = 10,
+    min_touch_ratio: float = 0.05,
+) -> bool:
+    current_pixels = _label_count(curr_counts, track_id)
+    if current_pixels == 0 or _label_count(prev_counts, track_id) == 0:
+        return False
+
+    curr_slice = _label_slice(curr_slices, track_id)
+    if curr_slice is None:
+        return False
+
+    region = _expanded_slice(curr_slice, curr_frame.shape, pad=1)
+    previous_mask = prev_frame[region] == track_id
+    if not np.any(previous_mask):
+        return False
+
+    current_mask = curr_frame[region] == track_id
+    dilated_previous = ndi_binary_dilation(previous_mask, structure=_STRUCTURE_3X3_BOOL)
+    touch_pixels = int(np.count_nonzero(current_mask & dilated_previous))
+    if touch_pixels < min_touch_pixels:
+        return False
+    return (touch_pixels / current_pixels) >= min_touch_ratio
+
+
+def _infer_parent_id_local(
+    prev_frame: np.ndarray,
+    curr_frame: np.ndarray,
+    child_track_id: int,
+    valid_track_ids: set[int],
+    curr_counts: np.ndarray,
+    curr_slices,
+    min_touch_pixels: int = 10,
+    min_touch_ratio: float = 0.05,
+) -> int:
+    child_pixels = _label_count(curr_counts, child_track_id)
+    if child_pixels == 0:
+        return 0
+
+    curr_slice = _label_slice(curr_slices, child_track_id)
+    if curr_slice is None:
+        return 0
+
+    region = _expanded_slice(curr_slice, curr_frame.shape, pad=1)
+    child_mask = curr_frame[region] == child_track_id
+    dilated_child = ndi_binary_dilation(child_mask, structure=_STRUCTURE_3X3_BOOL)
+    touching_labels = prev_frame[region][dilated_child]
+    touching_labels = touching_labels[touching_labels != 0]
+    if touching_labels.size == 0:
+        return 0
+
+    labels, counts = np.unique(touching_labels.astype(np.int64), return_counts=True)
+    candidates = []
+    for label_val, count in zip(labels.tolist(), counts.tolist()):
+        parent_id = int(label_val)
+        touch_count = int(count)
+        if parent_id == child_track_id:
+            continue
+        if parent_id not in valid_track_ids:
+            continue
+        candidates.append((touch_count, parent_id))
+
+    if not candidates:
+        return 0
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    best_touch_count, best_parent_id = candidates[0]
+
+    if best_touch_count < min_touch_pixels:
+        return 0
+    if (best_touch_count / child_pixels) < min_touch_ratio:
+        return 0
+
+    return best_parent_id
+
+
 def _active_cooldown_track_ids(cooldown_until: dict[int, int], frame_idx: int):
     return {track_id for track_id, end_frame in cooldown_until.items() if frame_idx <= end_frame}
 
@@ -531,29 +659,37 @@ def _rescue_cooldown_label_swaps(
     frame_idx: int,
     newborn_ids: list[int],
     protected_track_ids: set[int],
+    prev_counts: np.ndarray,
+    curr_counts: np.ndarray,
+    prev_slices,
 ):
     prev_frame = normalized_tensor[:, :, frame_idx - 1]
     curr_frame = normalized_tensor[:, :, frame_idx]
-    prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
-    curr_ids = set(_track_ids_in_frame(curr_frame).tolist())
     rescued_ids = set()
 
     for protected_id in sorted(protected_track_ids):
-        if protected_id not in prev_ids:
+        if _label_count(prev_counts, protected_id) == 0:
             continue
-        if protected_id in curr_ids:
+        if _label_count(curr_counts, protected_id) != 0:
             continue
 
-        previous_mask = prev_frame == protected_id
+        prev_slice = _label_slice(prev_slices, protected_id)
+        if prev_slice is None:
+            continue
+
+        region = _expanded_slice(prev_slice, prev_frame.shape, pad=1)
+        previous_mask = prev_frame[region] == protected_id
         if not np.any(previous_mask):
             continue
 
-        dilated_previous = binary_dilation(previous_mask, np.ones((3, 3), dtype=bool))
+        dilated_previous = ndi_binary_dilation(previous_mask, structure=_STRUCTURE_3X3_BOOL)
         candidates = []
         for newborn_id in newborn_ids:
             if newborn_id in rescued_ids:
                 continue
-            current_mask = curr_frame == newborn_id
+            if _label_count(curr_counts, newborn_id) == 0:
+                continue
+            current_mask = curr_frame[region] == newborn_id
             touch_pixels = int(np.count_nonzero(current_mask & dilated_previous))
             if touch_pixels > 0:
                 candidates.append((touch_pixels, newborn_id))
@@ -569,8 +705,6 @@ def _rescue_cooldown_label_swaps(
                 frame_t[rescue_pixels] = protected_id
 
         rescued_ids.add(rescued_id)
-        curr_ids.discard(rescued_id)
-        curr_ids.add(protected_id)
 
     return sorted(track_id for track_id in newborn_ids if track_id not in rescued_ids)
 
@@ -887,11 +1021,13 @@ def _normalize_ctc_divisions(
     for frame_idx in range(1, frame_count):
         prev_frame = normalized_tensor[:, :, frame_idx - 1]
         curr_frame = normalized_tensor[:, :, frame_idx]
-        prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
+        prev_counts, prev_slices = _frame_label_stats(prev_frame)
+        prev_ids = set(_track_ids_from_counts(prev_counts).tolist())
         if not prev_ids:
             continue
 
-        curr_ids = _track_ids_in_frame(curr_frame).tolist()
+        curr_counts, curr_slices = _frame_label_stats(curr_frame)
+        curr_ids = _track_ids_from_counts(curr_counts).tolist()
         newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
 
         protected_track_ids = (
@@ -905,25 +1041,39 @@ def _normalize_ctc_divisions(
                 frame_idx=frame_idx,
                 newborn_ids=newborn_ids,
                 protected_track_ids=protected_track_ids,
+                prev_counts=prev_counts,
+                curr_counts=curr_counts,
+                prev_slices=prev_slices,
             )
             prev_frame = normalized_tensor[:, :, frame_idx - 1]
             curr_frame = normalized_tensor[:, :, frame_idx]
-            prev_ids = set(_track_ids_in_frame(prev_frame).tolist())
-            curr_ids = _track_ids_in_frame(curr_frame).tolist()
+            prev_counts, prev_slices = _frame_label_stats(prev_frame)
+            prev_ids = set(_track_ids_from_counts(prev_counts).tolist())
+            curr_counts, curr_slices = _frame_label_stats(curr_frame)
+            curr_ids = _track_ids_from_counts(curr_counts).tolist()
             newborn_ids = sorted(track_id for track_id in curr_ids if track_id not in prev_ids)
 
         mother_to_children = {}
         newborn_id_set = set(newborn_ids)
         valid_parent_ids = prev_ids - protected_track_ids
         for child_id in curr_ids:
-            if child_id in prev_ids and _has_self_continuity(prev_frame, curr_frame, child_id):
-                continue
-            child_mask = curr_frame == child_id
-            mother_id = _infer_parent_id(
+            if child_id in prev_ids and _has_self_continuity_local(
                 prev_frame=prev_frame,
-                child_mask=child_mask,
+                curr_frame=curr_frame,
+                track_id=child_id,
+                prev_counts=prev_counts,
+                curr_counts=curr_counts,
+                prev_slices=prev_slices,
+                curr_slices=curr_slices,
+            ):
+                continue
+            mother_id = _infer_parent_id_local(
+                prev_frame=prev_frame,
+                curr_frame=curr_frame,
                 child_track_id=child_id,
                 valid_track_ids=valid_parent_ids,
+                curr_counts=curr_counts,
+                curr_slices=curr_slices,
             )
             if mother_id == 0:
                 continue
@@ -1273,6 +1423,7 @@ def _prepare_challenge_tracks(
         print("[TRACKING] export: normalizing CTC divisions + opt-in identity rescue", flush=True)
     else:
         print("[TRACKING] export: normalizing CTC divisions", flush=True)
+    stage_tic = time.perf_counter()
     normalized_tensor, division_parent_map = _normalize_ctc_divisions(
         final_tracked_tensor,
         division_cooldown_frames=division_cooldown_frames,
@@ -1280,13 +1431,20 @@ def _prepare_challenge_tracks(
         rescue_confidence_threshold=rescue_confidence_threshold,
         max_centroid_dist_px=max_centroid_dist_px,
     )
+    print(f"[TRACKING] export: CTC division normalization time={time.perf_counter() - stage_tic:.2f}s", flush=True)
 
     print("[TRACKING] export: scanning track frame ranges", flush=True)
+    stage_tic = time.perf_counter()
     frame_ranges = _scan_track_frame_ranges(normalized_tensor)
+    print(f"[TRACKING] export: scan track ranges time={time.perf_counter() - stage_tic:.2f}s", flush=True)
     print("[TRACKING] export: building res_track rows", flush=True)
+    stage_tic = time.perf_counter()
     rows = _build_res_track_from_parent_map(normalized_tensor, division_parent_map, frame_ranges)
+    print(f"[TRACKING] export: build res_track rows time={time.perf_counter() - stage_tic:.2f}s", flush=True)
     print("[TRACKING] export: validating res_track rows", flush=True)
+    stage_tic = time.perf_counter()
     _validate_res_track_rows(normalized_tensor, rows, frame_ranges)
+    print(f"[TRACKING] export: validate res_track rows time={time.perf_counter() - stage_tic:.2f}s", flush=True)
 
     final_object_count = max(frame_ranges) if frame_ranges else 0
     return normalized_tensor, rows, final_object_count
@@ -1501,6 +1659,8 @@ def run_tracking(
         is1 = np.copy(first_mask).astype(_TRACKING_DTYPE)
         iblank_g = np.zeros(is1.shape, dtype=_TRACKING_DTYPE)
         max_id_ever = int(np.max(is1)) if np.max(is1) > 0 else 0
+        raw_label_compact_initialized = False
+        raw_labels_guaranteed_compact = False
 
         tic = time.time()
 
@@ -1761,6 +1921,15 @@ def run_tracking(
                 is1 = tracked_stack[:, :, it0].copy()
                 if it0 == 0 or max_id_ever == 0:
                     max_id_ever = int(np.max(is2)) if np.max(is2) > 0 else 0
+                elif np.any(is2):
+                    raw_labels_guaranteed_compact = False
+
+            if not raw_label_compact_initialized and max_id_ever > 0:
+                raw_labels_guaranteed_compact = _labels_are_dense_prefix(
+                    tracked_stack[:, :, it0],
+                    max_id_ever,
+                )
+                raw_label_compact_initialized = True
 
         elapsed_time = time.time() - tic
         print(f"[TRACKING] main_loop_elapsed={elapsed_time:.2f}s")
@@ -1770,13 +1939,21 @@ def run_tracking(
         print("[TRACKING] post: compacting raw tracker labels", flush=True)
         mask0 = tracked_stack
         # OPT-3: LUT-based compaction – one global pass instead of per-frame label loops
-        raw_track_count, raw_max_label = _compact_labels_in_place_fast(mask0)
+        stage_tic = time.perf_counter()
+        if raw_labels_guaranteed_compact:
+            raw_track_count = int(max_id_ever)
+            raw_max_label = int(max_id_ever)
+        else:
+            raw_track_count, raw_max_label = _compact_labels_in_place_fast(mask0)
+        print(f"[TRACKING] post: compact raw tracker labels time={time.perf_counter() - stage_tic:.2f}s", flush=True)
         if raw_track_count > 0:
             print(
                 f"[TRACKING] post: raw tracker labels used={raw_track_count} "
                 f"max_label_before_compaction={raw_max_label}",
                 flush=True,
             )
+            if raw_labels_guaranteed_compact or raw_track_count == raw_max_label:
+                print("[TRACKING] post: raw tracker labels already compact; skipped remap", flush=True)
 
         dz = int(mask0.shape[2])
         final_number_frames = dz
@@ -1801,6 +1978,7 @@ def run_tracking(
                 f"output={final_output_dir}",
                 flush=True,
             )
+            stage_tic = time.perf_counter()
             report = temporal_downsample_tracked_stack(
                 tracked_stack=normalized_tensor,
                 input_tracks=rows,
@@ -1813,6 +1991,7 @@ def run_tracking(
                 output_digits=final_output_digits,
                 pad_missing_with_empty=pad_missing_with_empty,
             )
+            print(f"[TRACKING] export: final-only downsample/write time={time.perf_counter() - stage_tic:.2f}s", flush=True)
             track_count = int(report["tracks"])
             final_number_objects = track_count
             final_number_frames = int(report["frames"])
