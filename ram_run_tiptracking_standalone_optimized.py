@@ -976,6 +976,7 @@ def _normalize_ctc_divisions(
     identity_rescue_gap: int = 0,
     rescue_confidence_threshold: float = 0.30,
     max_centroid_dist_px: float = 50.0,
+    allow_internal_labels_above_uint16: bool = False,
 ):
     if division_cooldown_frames < 0:
         raise ValueError("division_cooldown_frames must be >= 0.")
@@ -984,7 +985,7 @@ def _normalize_ctc_divisions(
 
     max_uint16 = int(np.iinfo(np.uint16).max)
     max_input_id = int(np.max(final_tracked_tensor)) if final_tracked_tensor.size else 0
-    if max_input_id > max_uint16:
+    if max_input_id > max_uint16 and not allow_internal_labels_above_uint16:
         raise ValueError("Track IDs exceed uint16 capacity required for challenge mask export.")
 
     normalized_tensor = final_tracked_tensor
@@ -1089,7 +1090,7 @@ def _normalize_ctc_divisions(
 
             if mother_id in curr_id_set:
                 max_track_id += 1
-                if max_track_id > max_uint16:
+                if max_track_id > max_uint16 and not allow_internal_labels_above_uint16:
                     raise ValueError("Division normalization would exceed uint16 track ID capacity.")
                 continuation_daughter_id = max_track_id
 
@@ -1112,7 +1113,7 @@ def _normalize_ctc_divisions(
                     daughter_id = child_id
                 else:
                     max_track_id += 1
-                    if max_track_id > max_uint16:
+                    if max_track_id > max_uint16 and not allow_internal_labels_above_uint16:
                         raise ValueError("Division normalization would exceed uint16 track ID capacity.")
                     daughter_id = max_track_id
                     _fork_existing_daughter_label(normalized_tensor, child_id, frame_idx, daughter_id)
@@ -1418,6 +1419,7 @@ def _prepare_challenge_tracks(
     identity_rescue_gap: int = 0,
     rescue_confidence_threshold: float = 0.30,
     max_centroid_dist_px: float = 50.0,
+    allow_internal_labels_above_uint16: bool = False,
 ):
     if identity_rescue_gap > 0:
         print("[TRACKING] export: normalizing CTC divisions + opt-in identity rescue", flush=True)
@@ -1430,6 +1432,7 @@ def _prepare_challenge_tracks(
         identity_rescue_gap=identity_rescue_gap,
         rescue_confidence_threshold=rescue_confidence_threshold,
         max_centroid_dist_px=max_centroid_dist_px,
+        allow_internal_labels_above_uint16=allow_internal_labels_above_uint16,
     )
     print(f"[TRACKING] export: CTC division normalization time={time.perf_counter() - stage_tic:.2f}s", flush=True)
 
@@ -1467,6 +1470,7 @@ def _write_challenge_outputs(
         identity_rescue_gap=identity_rescue_gap,
         rescue_confidence_threshold=rescue_confidence_threshold,
         max_centroid_dist_px=max_centroid_dist_px,
+        allow_internal_labels_above_uint16=False,
     )
 
     print("[TRACKING] export: writing res_track.txt", flush=True)
@@ -1971,6 +1975,7 @@ def run_tracking(
                 identity_rescue_gap=identity_rescue_gap,
                 rescue_confidence_threshold=rescue_confidence_threshold,
                 max_centroid_dist_px=max_centroid_dist_px,
+                allow_internal_labels_above_uint16=True,
             )
             print(
                 f"[TRACKING] export: writing final-only downsampled result "

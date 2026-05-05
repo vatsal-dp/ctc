@@ -205,6 +205,17 @@ class CTCPipelineToolTests(unittest.TestCase):
             np.array([[0, 1, 0], [2, 0, 1]], dtype=np.uint16),
         )
 
+    def test_downsample_relabel_mask_maps_high_internal_labels_to_uint16(self):
+        mask = np.array([[0, 70000], [70001, 70000]], dtype=np.uint32)
+
+        relabeled = _relabel_mask(mask, {70000: 1, 70001: 2})
+
+        self.assertEqual(relabeled.dtype, np.uint16)
+        np.testing.assert_array_equal(
+            relabeled,
+            np.array([[0, 1], [2, 1]], dtype=np.uint16),
+        )
+
     def _division_stack(self, frame_count=3):
         stack = np.zeros((12, 12, frame_count), dtype=np.uint16)
         stack[2:8, 2:8, 0] = 1
@@ -354,6 +365,32 @@ class CTCPipelineToolTests(unittest.TestCase):
                     stack[row : row + height, col : col + width, frame_idx] = label_id
 
             self._assert_ram_normalize_matches_standalone(stack, division_cooldown_frames=3)
+
+    def test_ram_normalize_ctc_divisions_rejects_high_labels_in_strict_mode(self):
+        stack = np.zeros((12, 12, 2), dtype=np.uint32)
+        stack[2:8, 2:8, 0] = 70000
+        stack[2:5, 2:8, 1] = 70000
+        stack[5:8, 2:8, 1] = 70001
+
+        with self.assertRaisesRegex(ValueError, "Track IDs exceed uint16 capacity"):
+            _normalize_ctc_divisions_ram(stack, division_cooldown_frames=20)
+
+    def test_ram_normalize_ctc_divisions_allows_high_internal_labels_for_final_only(self):
+        stack = np.zeros((12, 12, 2), dtype=np.uint32)
+        stack[2:8, 2:8, 0] = 70000
+        stack[2:5, 2:8, 1] = 70000
+        stack[5:8, 2:8, 1] = 70001
+
+        normalized, parent_map = _normalize_ctc_divisions_ram(
+            stack,
+            division_cooldown_frames=20,
+            allow_internal_labels_above_uint16=True,
+        )
+
+        self.assertEqual(parent_map, {70001: 70000, 70002: 70000})
+        self.assertEqual(set(np.unique(normalized[:, :, 0]).tolist()), {0, 70000})
+        self.assertEqual(set(np.unique(normalized[:, :, 1]).tolist()), {0, 70001, 70002})
+        self.assertFalse(np.any(normalized[:, :, 1] == 70000))
 
     def test_division_cooldown_rescues_daughter_label_swap(self):
         stack = self._division_stack(frame_count=3)
@@ -614,6 +651,37 @@ class CTCPipelineToolTests(unittest.TestCase):
                     tifffile.imread(stack_output_dir / path.name),
                     tifffile.imread(path),
                 )
+
+    def test_temporal_downsample_tracked_stack_exports_high_internal_labels_as_uint16(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "01_RES"
+            stack = np.zeros((4, 4, 2), dtype=np.uint32)
+            stack[0:2, 0:2, 0] = 70000
+            stack[2:4, 2:4, 1] = 70001
+            input_tracks = [
+                (70000, 0, 0, 0),
+                (70001, 1, 1, 70000),
+            ]
+
+            report = temporal_downsample_tracked_stack(
+                tracked_stack=stack,
+                input_tracks=input_tracks,
+                output_result_dir=output_dir,
+                source_root=None,
+                sequence="01",
+                source_frame_count=2,
+                factor=1,
+                offset=0,
+            )
+
+            self.assertEqual(report["tracks"], 2)
+            self.assertEqual((output_dir / "res_track.txt").read_text(encoding="utf-8"), "1 0 0 0\n2 1 1 1\n")
+            mask0 = tifffile.imread(output_dir / "mask000.tif")
+            mask1 = tifffile.imread(output_dir / "mask001.tif")
+            self.assertEqual(mask0.dtype, np.uint16)
+            self.assertEqual(mask1.dtype, np.uint16)
+            self.assertEqual(set(np.unique(mask0).tolist()), {0, 1})
+            self.assertEqual(set(np.unique(mask1).tolist()), {0, 2})
 
     def test_temporal_downsample_preserves_nonzero_source_frame_indices(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -292,7 +292,10 @@ def _build_output_tracks(
         for begin, end in _contiguous_runs(label_frames[old_label]):
             new_label = len(rows_without_parents) + 1
             if new_label > MAX_UINT16:
-                raise ValueError("Downsampled track count exceeds uint16 capacity.")
+                raise ValueError(
+                    "Final CTC output exceeds uint16 capacity: "
+                    f"sampled output would contain more than {MAX_UINT16} tracks."
+                )
             row = (old_label, new_label, begin, end)
             rows_without_parents.append(row)
             tracks_by_old_label.setdefault(old_label, []).append(row)
