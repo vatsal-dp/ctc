@@ -367,6 +367,44 @@ def _choose_mmap_dir(output_dir: Path, mmap_dir: Path | None, estimated_stack_by
     return mmap_dir
 
 
+def _memmap_nbytes(shape: tuple[int, ...], dtype) -> int:
+    item_count = 1
+    for dim in shape:
+        dim = int(dim)
+        if dim < 0:
+            raise ValueError(f"memmap shape dimensions must be non-negative; got {shape}")
+        item_count *= dim
+
+    return max(item_count * np.dtype(dtype).itemsize, 1)
+
+
+def _create_tracking_memmap(path: Path, dtype, shape: tuple[int, ...]) -> np.memmap:
+    byte_count = _memmap_nbytes(shape, dtype)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with path.open("wb") as fid:
+            fid.truncate(byte_count)
+
+        return np.memmap(
+            path,
+            mode="r+",
+            dtype=dtype,
+            shape=shape,
+        )
+    except OSError as exc:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            "Could not create the disk-backed tracking stack at "
+            f"{path} ({_format_gib(byte_count)}). Try --mmap-dir on a local "
+            "NTFS scratch disk with enough free space; mapped/network drives "
+            "can reject large memmap file creation."
+        ) from exc
+
+
 def _natural_sort_key(text: str):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
@@ -1653,9 +1691,8 @@ def run_tracking(
     final_tracked_tensor = None
     mask_2_change = None
     try:
-        tracked_stack = np.memmap(
+        tracked_stack = _create_tracking_memmap(
             tracked_stack_path,
-            mode="w+",
             dtype=_TRACKING_DTYPE,
             shape=(frame_shape[0], frame_shape[1], im_no),
         )

@@ -5,12 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import tifffile
 
 from analyze_tracking_failures import analyze_failures
 from evaluate_ctc_results import summarize_official_logs
+import ram_run_tiptracking_standalone_optimized as ram_tracking
 from run_ctc_training_pipeline import _run_sequence, _tracking_position_for_sequence
 from run_tiptracking_standalone import (
     _compact_labels_in_place,
@@ -49,6 +51,30 @@ class CTCPipelineToolTests(unittest.TestCase):
         self.assertTrue(_looks_like_network_path(Path(r"\\server\share\tracking_output")))
         self.assertTrue(_looks_like_network_path(Path("//server/share/tracking_output")))
         self.assertFalse(_looks_like_network_path(Path("/tmp/tracking_output")))
+
+    def test_ram_tracking_memmap_is_presized_before_numpy_maps_it(self):
+        create_memmap = getattr(ram_tracking, "_create_tracking_memmap", None)
+        self.assertIsNotNone(create_memmap)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mmap_path = Path(tmp) / "tracked.uint32.mmap"
+            shape = (3, 4, 5)
+            dtype = np.uint32
+            expected_nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+
+            with mock.patch.object(
+                ram_tracking.np,
+                "memmap",
+                wraps=ram_tracking.np.memmap,
+            ) as memmap_mock:
+                tracked_stack = create_memmap(mmap_path, dtype=dtype, shape=shape)
+                try:
+                    self.assertEqual(mmap_path.stat().st_size, expected_nbytes)
+                    self.assertEqual(tracked_stack.shape, shape)
+                    self.assertEqual(tracked_stack.dtype, np.dtype(dtype))
+                    self.assertEqual(memmap_mock.call_args.kwargs["mode"], "r+")
+                finally:
+                    tracked_stack._mmap.close()
 
     def test_output_digits_auto_and_bounds(self):
         self.assertEqual(_resolve_output_digits("auto", [Path("mask000.tif")], 2), 3)
