@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Downsample interpolated CTC tracking results back to the source timeline.
+
+FILM interpolation and tracking can run on a denser timeline than the original
+CTC sequence. This module selects every Nth tracked frame, rebuilds compact
+uint16 labels, preserves valid parent links, and writes a final result folder
+whose frame numbers match the source sequence.
+"""
 
 import argparse
 import re
@@ -17,6 +24,7 @@ MAX_UINT16 = int(np.iinfo(np.uint16).max)
 
 @dataclass(frozen=True)
 class InputTrackRow:
+    """One row from an input res_track.txt file before downsampling."""
     label: int
     begin: int
     end: int
@@ -25,6 +33,7 @@ class InputTrackRow:
 
 @dataclass(frozen=True)
 class OutputTrackRow:
+    """One row written to the downsampled res_track.txt file."""
     old_label: int
     label: int
     begin: int
@@ -285,6 +294,7 @@ def _build_output_tracks(
     label_frames: dict[int, list[int]],
     input_rows: dict[int, InputTrackRow],
 ):
+    """Create compact output track rows from sampled label lifetimes."""
     rows_without_parents: list[tuple[int, int, int, int]] = []
     tracks_by_old_label: dict[int, list[tuple[int, int, int, int]]] = {}
 
@@ -441,6 +451,7 @@ def temporal_downsample_tracked_stack(
     offset: int = 0,
     output_digits: str = "auto",
 ):
+    """Downsample an in-memory HxWxT tracked stack and write CTC files."""
     output_result_dir = output_result_dir.resolve()
     source_root = source_root.resolve() if source_root is not None else None
     sequence = _normalize_sequence(sequence)
@@ -534,6 +545,7 @@ def temporal_downsample_ctc_results(
     offset: int = 0,
     output_digits: str = "auto",
 ):
+    """Downsample mask files already written to an intermediate result folder."""
     input_result_dir = input_result_dir.resolve()
     output_result_dir = output_result_dir.resolve()
     source_root = source_root.resolve() if source_root is not None else None

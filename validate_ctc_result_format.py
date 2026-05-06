@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Validate that a folder is safe to pass to official CTC metrics.
+
+The official binaries tend to fail late and tersely when filenames, masks, or
+res_track.txt disagree. This validator checks those contracts first: fixed
+digit naming, contiguous frame indices, uint16 labels, shape consistency,
+track-row lifetimes, parent IDs, and source/result frame alignment.
+"""
 
 import argparse
 import re
@@ -11,11 +18,13 @@ import tifffile
 
 
 class ValidationError(Exception):
+    """Raised when a CTC result folder violates an expected file contract."""
     pass
 
 
 @dataclass
 class TrackRow:
+    """Parsed L B E P row from res_track.txt."""
     label: int
     begin: int
     end: int
@@ -204,6 +213,7 @@ def validate_ctc_result_format(
     source_root: Path | None = None,
     allow_non_uint16: bool = False,
 ):
+    """Validate one <sequence>_RES directory and return a compact report."""
     sequence = _normalize_sequence(sequence)
     dataset_root = dataset_root.resolve()
     source_root = source_root.resolve() if source_root is not None else None

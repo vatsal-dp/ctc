@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Copy a fixed PNG frame range into a trial folder.
+
+This small utility predates the CTC pipeline scripts and is kept for manual
+experiments on a Windows-style interpolation workspace. Prefer the newer CTC
+subset/downsample scripts for challenge-format data.
+"""
 
 import argparse
 import shutil

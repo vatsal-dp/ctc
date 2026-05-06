@@ -1,5 +1,9 @@
-"""
-Optimized FILM interpolation script with CUDA support and Async I/O.
+"""Interpolate frame sequences with a TensorFlow FILM model.
+
+The CTC workflow uses this to densify the time axis before segmentation and
+tracking. It preserves the input bit depth/layout where possible, supports
+TIFF microscopy frames, and can stream from disk or load frames into memory for
+faster repeated GPU batches.
 """
 import os
 

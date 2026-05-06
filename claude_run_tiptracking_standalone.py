@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Legacy experimental tip-tracking runner.
+
+This variant is kept for comparison with the reference and optimized runners.
+It is not the default workflow entrypoint; use
+ram_run_tiptracking_standalone_optimized.py for large CTC runs and keep this
+file in sync only when intentionally comparing algorithm variants.
+"""
 
 import argparse
 import gc
@@ -824,6 +831,7 @@ def run_tracking(
     rescue_confidence_threshold: float = 0.30,
     max_centroid_dist_px: float = 50.0,
 ):
+    """Run the legacy in-memory tracker and write CTC-format outputs."""
     output_dir.mkdir(parents=True, exist_ok=True)
     if down_factor != 1:
         raise ValueError("Challenge export requires down_factor=1 to preserve exact frame indexing.")

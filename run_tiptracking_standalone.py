@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""Reference standalone tip-tracking runner.
+
+This file keeps the simpler in-memory implementation that tests compare
+against the optimized memmap runner. Prefer
+ram_run_tiptracking_standalone_optimized.py for large CTC sequences, but keep
+behavioral changes here in sync when they are meant to affect default
+tracking semantics.
+"""
 
 import argparse
 import gc
@@ -623,6 +631,7 @@ def run_tracking(
     output_digits: str,
     division_cooldown_frames: int,
 ):
+    """Run the reference in-memory tracker and write CTC-format outputs."""
     output_dir.mkdir(parents=True, exist_ok=True)
     if down_factor != 1:
         raise ValueError("Challenge export requires down_factor=1 to preserve exact frame indexing.")

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Rescale paired images and label masks while preserving label IDs.
+
+Images use configurable interpolation, but masks always use nearest-neighbor
+resizing so integer track labels remain valid. The helper can also copy an
+existing res_track.txt next to the resized masks.
+"""
 
 import argparse
 import re
@@ -17,6 +23,7 @@ IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
 
 @dataclass(frozen=True)
 class RescaleResult:
+    """Shape and path summary for one resized file."""
     source: Path
     destination: Path
     original_shape: tuple[int, ...]
@@ -80,6 +87,7 @@ def _restore_dtype(array: np.ndarray, dtype: np.dtype):
 
 
 def resize_image_array(array: np.ndarray, scale: float, order: int = 1):
+    """Resize intensity images with interpolation appropriate for images."""
     output_shape = _spatial_output_shape(array, scale)
     resized = resize(
         array,
@@ -93,6 +101,7 @@ def resize_image_array(array: np.ndarray, scale: float, order: int = 1):
 
 
 def resize_mask_array(array: np.ndarray, scale: float):
+    """Resize label masks with nearest-neighbor interpolation only."""
     output_shape = _spatial_output_shape(array, scale)
     resized = resize(
         array,
@@ -134,6 +143,7 @@ def rescale_dataset(
     image_order: int = 1,
     copy_track_file: bool = True,
 ):
+    """Rescale an image folder and matching mask folder into new folders."""
     if not image_dir.is_dir():
         raise NotADirectoryError(f"image-dir does not exist or is not a directory: {image_dir}")
     if not mask_dir.is_dir():

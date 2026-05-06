@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Create a smaller CTC dataset slice with frame numbers rebased to zero.
+
+This is useful for debugging long sequences: it copies source images and any
+available GT TRA/SEG masks for a contiguous frame range, rewrites the GT track
+file so lifetimes are clipped to the slice, and records the source-to-output
+frame mapping in CSV form.
+"""
 
 import argparse
 import csv
@@ -14,6 +21,7 @@ IMAGE_SUFFIXES = {".tif", ".tiff"}
 
 @dataclass(frozen=True)
 class TrackRow:
+    """One GT track row before or after clipping to a subset."""
     label: int
     begin: int
     end: int
@@ -157,6 +165,7 @@ def _parse_track_file(path: Path):
 
 
 def _clip_track_rows(rows: dict[int, TrackRow], start_frame: int, end_frame: int):
+    """Clip GT lifetimes to the selected frame range and fix parent links."""
     clipped: dict[int, TrackRow] = {}
     for label, row in sorted(rows.items()):
         if row.end < start_frame or row.begin > end_frame:
@@ -201,6 +210,7 @@ def subset_ctc_sequence_range(
     output_digits: str = "auto",
     overwrite: bool = False,
 ):
+    """Copy and reindex one contiguous CTC sequence range."""
     if start_frame > end_frame:
         raise ValueError("--start-frame must be <= --end-frame.")
     if not source_root.is_dir():

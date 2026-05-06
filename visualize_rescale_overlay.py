@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Render before/after overlays for resized image and mask pairs.
+
+The CSV metrics flag label loss/gain and foreground-area drift after spatial
+rescaling, while the PNG overlays make it quick to inspect whether nearest
+neighbor mask resizing kept labels aligned with the images.
+"""
 
 import argparse
 import csv
@@ -146,6 +152,7 @@ def export_rescale_overlay_comparisons(
     max_frames: int | None = None,
     every: int = 1,
 ):
+    """Write overlay PNGs and per-frame rescale metrics."""
     frame_count = min(
         len(original_image_files),
         len(original_mask_files),

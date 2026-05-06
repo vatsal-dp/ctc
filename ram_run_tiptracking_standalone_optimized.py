@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""Memory-conscious optimized tip-tracking runner for CTC submissions.
+
+Inputs are instance-segmentation masks from Cellpose or another segmenter.
+The runner carries label identities forward frame by frame, stores the working
+stack as a disk-backed memmap for long movies, normalizes division semantics
+into CTC-compatible parent rows, and writes mask*.tif plus res_track.txt.
+
+The older run_tiptracking_standalone.py is kept as a simpler reference path
+for tests. This optimized version should preserve the same default tracking
+semantics while adding memmap I/O, prefetching, parallel TIFF writes, and an
+opt-in identity rescue pass.
+"""
 
 import argparse
 import concurrent.futures
@@ -1016,6 +1028,12 @@ def _normalize_ctc_divisions(
     max_centroid_dist_px: float = 50.0,
     allow_internal_labels_above_uint16: bool = False,
 ):
+    """Relabel division events so CTC parent/daughter rules are satisfied.
+
+    CTC expects a parent track to end before daughter tracks begin. If the
+    tracker reuses the mother's label after a split, this function forks that
+    continuation into a new daughter ID and records the parent relationship.
+    """
     if division_cooldown_frames < 0:
         raise ValueError("division_cooldown_frames must be >= 0.")
     if identity_rescue_gap < 0:
@@ -1338,6 +1356,12 @@ def _split_discontinuous_tracks(
     time_series_threshold: int,
     max_track_id: int = _MAX_CTC_TRACK_ID,
 ):
+    """Split same-label temporal gaps into independent track IDs.
+
+    Raw tracker labels sometimes disappear and later reappear. CTC rows must
+    describe contiguous lifetimes, so each later run is relabeled unless it is
+    shorter than the configured threshold or the uint16 label budget is full.
+    """
     obj = np.where(np.any(tp_im != 0, axis=1))[0] + 1
     numb_m1 = int(mask_stack.shape[2])
     free_label_ids = np.where(~np.any(tp_im != 0, axis=1))[0] + 1
@@ -1459,6 +1483,7 @@ def _prepare_challenge_tracks(
     max_centroid_dist_px: float = 50.0,
     allow_internal_labels_above_uint16: bool = False,
 ):
+    """Prepare a tracked stack and res_track rows for challenge export."""
     if identity_rescue_gap > 0:
         print("[TRACKING] export: normalizing CTC divisions + opt-in identity rescue", flush=True)
     else:
@@ -1501,6 +1526,7 @@ def _write_challenge_outputs(
     max_centroid_dist_px: float = 50.0,
     tiff_write_workers: int = 4,
 ):
+    """Write CTC mask*.tif files and the matching res_track.txt."""
     result_dir.mkdir(parents=True, exist_ok=True)
     normalized_tensor, rows, final_object_count = _prepare_challenge_tracks(
         final_tracked_tensor=final_tracked_tensor,
@@ -1603,6 +1629,14 @@ def run_tracking(
     final_output_digits: str = "auto",
     pad_missing_with_empty: bool = False,
 ):
+    """Track all masks in a folder and export CTC-format results.
+
+    The main loop keeps the tracker state in the original MATLAB-inspired
+    order, then post-processes labels for CTC constraints. ``export_mode`` is
+    the important integration switch: ``full`` writes every tracked frame,
+    while ``final-only`` samples the interpolated stack back to the source
+    timeline and writes only the final submission frames.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     if down_factor != 1:
         raise ValueError("Challenge export requires down_factor=1 to preserve exact frame indexing.")

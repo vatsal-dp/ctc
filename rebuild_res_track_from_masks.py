@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Rebuild res_track.txt by scanning labels in an existing result folder.
+
+Use this only as a repair tool when masks are already CTC-compatible and each
+label appears in one contiguous run. If a label disappears and reappears, the
+exporter/downsampler must split or remap it instead of rebuilding rows
+blindly.
+"""
 
 import argparse
 import re
@@ -13,6 +20,7 @@ import tifffile
 
 @dataclass
 class TrackSpan:
+    """Observed contiguous lifetime of one label in mask*.tif files."""
     begin: int
     end: int
     last_seen: int
@@ -76,6 +84,7 @@ def _scan_mask_spans(mask_files: list[Path]):
 
 
 def rebuild_res_track(result_dir: Path, backup: bool = True, dry_run: bool = False):
+    """Write res_track.txt from mask lifetimes, preserving valid parents."""
     result_dir = result_dir.resolve()
     mask_files = sorted(result_dir.glob("mask*.tif"), key=lambda path: _natural_sort_key(path.name))
     if not mask_files:

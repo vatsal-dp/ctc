@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Export arbitrary tracked masks or pickled stacks as a CTC result folder.
+
+Use this when a tracking experiment already produced label masks but not the
+challenge file layout. The exporter normalizes input arrays, optionally
+infers division parents from frame-to-frame contact, splits gapped labels into
+contiguous track rows, and writes mask*.tif plus res_track.txt.
+"""
 
 import argparse
 import pickle
@@ -33,6 +40,7 @@ PREFERRED_PICKLE_KEYS = (
 
 @dataclass(frozen=True)
 class TrackRun:
+    """A contiguous lifetime for one original label after CTC remapping."""
     old_label: int
     label: int
     begin: int
@@ -115,6 +123,7 @@ def _describe_pickle_object(obj, depth: int = 0, max_items: int = 8):
 
 
 def _find_array_like(obj):
+    """Search common pickle layouts for the first mask-stack-like object."""
     if isinstance(obj, np.ndarray):
         return obj
     if isinstance(obj, dict):
@@ -452,6 +461,7 @@ def _normalize_ctc_divisions(
     min_touch_pixels: int,
     min_touch_ratio: float,
 ):
+    """Infer mother/daughter relationships and relabel reused continuations."""
     if division_cooldown_frames < 0:
         raise ValueError("--division-cooldown-frames must be >= 0.")
 
@@ -583,6 +593,7 @@ def _scan_label_frames(frames: list[np.ndarray]):
 
 
 def _build_track_runs(label_frames: dict[int, list[int]], parent_map: dict[int, int] | None = None):
+    """Build compact CTC rows, splitting labels that have temporal gaps."""
     parent_map = parent_map or {}
     rows_without_parents: list[TrackRun] = []
     rows_by_old_label: dict[int, list[TrackRun]] = {}
@@ -656,6 +667,7 @@ def export_ctc_result(
     min_touch_pixels: int = 10,
     min_touch_ratio: float = 0.05,
 ):
+    """Write frames as a complete CTC result directory."""
     if not frames:
         raise ValueError("No frames to export.")
     frame_count = len(frames)

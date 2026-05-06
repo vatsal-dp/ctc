@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Full CTC submission workflow:
+#   source frames -> FILM interpolation -> Cellpose masks -> tip tracking
+#   -> final CTC result masks/res_track.txt -> optional official metrics.
+#
+# This shell entrypoint owns environment bootstrap and file layout. The Python
+# scripts own format-sensitive transformations such as relabeling, division
+# inference, downsampling, and validation.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Keep system/user-site Python packages from leaking into the workflow env.
@@ -236,6 +244,8 @@ abs_path_under_script_dir() {
 }
 
 configure_ctc_entrypoint_defaults() {
+  # Official CTC software can call a dataset-specific script with no arguments.
+  # If this file is named DatasetName-01.sh, infer paths relative to SW/.
   local script_name dataset sequence
   script_name="$(basename "${BASH_SOURCE[0]}")"
 
@@ -402,6 +412,8 @@ bootstrap_venv_env() {
 }
 
 bootstrap_python_environment() {
+  # Resolve or create the Python environment before any expensive work starts.
+  # Dry-run keeps this path side-effect free for CI tests of command assembly.
   local manager base_python
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -723,6 +735,9 @@ validate_args() {
 }
 
 run_sequence() {
+  # Per-sequence stage order matters: tracking reads interpolated segmentation
+  # masks, final-only tracking may skip the standalone downsampling step, and
+  # validation/evaluation expect final CTC files under OUTPUT_ROOT/<seq>_RES.
   local sequence="$1"
   local source_dir="$DATASET_ROOT/$sequence"
   local seq_work="$WORK_ROOT/$sequence"

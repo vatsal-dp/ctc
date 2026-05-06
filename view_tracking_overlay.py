@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Visualize tracking masks over source images with optional lineage plots.
+
+The interactive viewer is for quick inspection; export mode renders every
+frame to PNG so failure cases can be reviewed or shared. Track colors are
+stable by ID, and lineage rows come from res_track.txt.
+"""
 
 import argparse
 import re
@@ -20,6 +26,7 @@ GOLDEN_RATIO_CONJUGATE = 0.618033988749895
 
 @dataclass(frozen=True)
 class TrackRow:
+    """Parsed row from res_track.txt used for lineage drawing."""
     label: int
     begin: int
     end: int
@@ -28,6 +35,7 @@ class TrackRow:
 
 @dataclass
 class LineageLayout:
+    """Precomputed y positions and child links for the lineage timeline."""
     y_positions: dict[int, float]
     children: dict[int, list[int]]
     roots: list[int]
@@ -158,6 +166,7 @@ def _parse_track_file(path: Path):
 
 
 def _build_lineage_layout(track_rows: dict[int, TrackRow]):
+    """Assign stable vertical positions to lineage branches."""
     if not track_rows:
         return None
 
@@ -582,6 +591,7 @@ def export_overlay_lineage_frames(
     lineage_window: int | None = None,
     lineage_active_only: bool = False,
 ):
+    """Render side-by-side overlay and lineage PNGs for every frame."""
     if not track_rows:
         raise ValueError("Export mode requires a lineage file with track rows.")
     if len(image_files) != len(mask_files):

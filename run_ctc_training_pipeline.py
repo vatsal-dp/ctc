@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""Run the Python-only CTC tracking pipeline for one or more sequences.
+
+This script is the smaller orchestration layer used by tests and local
+experiments. The full bash workflow also performs FILM interpolation,
+Cellpose segmentation, and environment bootstrap; this runner assumes masks
+already exist and wires together tracking, temporal downsampling, format
+validation, official metrics, and local failure reports.
+"""
 
 import argparse
 import platform
@@ -35,6 +43,7 @@ def _shell_quote(text: str) -> str:
 
 
 def _run_command(command: list[str], log_path: Path, dry_run: bool):
+    """Run a subprocess while teeing its combined output to a stage log."""
     printable = _format_command(command)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -95,6 +104,7 @@ def _tracking_position_for_sequence(sequence: str, temporal_downsample_factor: i
 
 
 def _run_sequence(args, script_dir: Path, sequence: str):
+    """Execute all requested pipeline stages for a single CTC sequence."""
     python_exe = Path(args.python).expanduser()
     source_root = args.source_root.resolve()
     eval_root = args.eval_root.resolve()
@@ -121,6 +131,8 @@ def _run_sequence(args, script_dir: Path, sequence: str):
                             "unless Developer Mode/admin symlinks are enabled."
                         ) from exc
 
+    # Tracking can produce either the final CTC result directly or an
+    # interpolated intermediate result that is downsampled in the next stage.
     if not args.skip_tracking:
         mask_dir = _mask_dir_for_sequence(source_root, sequence, args.mask_dir_template)
         command = [
@@ -164,6 +176,8 @@ def _run_sequence(args, script_dir: Path, sequence: str):
             ]
             _run_command(command, log_dir / f"{sequence}_temporal_downsample.log", args.dry_run)
 
+    # Validate before official scoring so failures are explained with local
+    # checks instead of opaque metric-binary errors.
     if not args.skip_validation:
         command = [
             str(python_exe),

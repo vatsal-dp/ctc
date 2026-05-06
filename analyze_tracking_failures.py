@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""Generate local diagnostics for CTC tracking failures.
+
+The official metrics provide scores, but this script produces actionable CSVs
+and thumbnails: missed GT objects, extra result labels, ID switches, split or
+merged objects, bad division parents, low SEG IoU, and suspicious centroid
+jumps. It is meant for iteration after validation/evaluation fails or scores
+drop unexpectedly.
+"""
 
 import argparse
 import csv
@@ -192,6 +200,7 @@ def analyze_failures(
     jump_factor: float,
     max_thumbnails: int,
 ):
+    """Compare one result sequence against GT and write diagnostic artifacts."""
     sequence = _normalize_sequence(sequence)
     dataset_root = dataset_root.resolve()
     source_root = source_root.resolve()

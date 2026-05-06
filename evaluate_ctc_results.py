@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Run and summarize the official Cell Tracking Challenge metrics.
+
+This wrapper locates the platform-specific TRA/SEG/DET executables, prepares a
+temporary evaluation layout when GT is stored elsewhere, runs the binaries, and
+parses their logs into CSV summaries that are easier to compare between runs.
+"""
 
 import argparse
 import csv
@@ -86,6 +92,7 @@ def _is_probable_executable(path: Path):
 
 
 def find_metric_executable(metric: str, software_dir: Path | None):
+    """Find a TRA/SEG/DET executable in EvaluationSoftware or on PATH."""
     metric = metric.upper()
     candidates = _candidate_executable_names(metric)
 
@@ -149,6 +156,7 @@ def _parse_penalty(value: str | None):
 
 
 def parse_tra_det_log(log_path: Path, metric: str):
+    """Parse official TRA/DET penalty sections into one row per category."""
     metric = metric.upper()
     if metric not in TRA_DET_SECTIONS:
         raise ValueError(f"TRA/DET log parser does not support metric {metric!r}.")
@@ -203,6 +211,7 @@ def parse_tra_det_log(log_path: Path, metric: str):
 
 
 def parse_seg_log(log_path: Path, low_jaccard_threshold: float = 0.5):
+    """Parse official SEG object Jaccard details and low-score objects."""
     text = log_path.read_text(encoding="utf-8", errors="replace")
     score = parse_official_score(text, "SEG")
     sequence = _sequence_from_result_dir(log_path.parent)
@@ -279,6 +288,7 @@ def summarize_official_logs(
     sequences: list[str] | None = None,
     low_jaccard_threshold: float = 0.5,
 ):
+    """Collect score and penalty summaries from existing CTC metric logs."""
     result_dirs = find_result_dirs(dataset_root, sequences)
     tra_rows = []
     det_rows = []
@@ -422,6 +432,7 @@ def run_metric(
     result_dir: Path,
     det_penalize_extra_detections: int | None,
 ):
+    """Execute one official metric binary and archive its output/log files."""
     metric = metric.upper()
     command = [str(executable), str(eval_root), sequence, str(digits)]
     if metric == "DET" and det_penalize_extra_detections is not None:
