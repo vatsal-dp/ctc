@@ -39,6 +39,7 @@ from temporal_downsample_ctc_results import temporal_downsample_tracked_stack
 _MAX_CTC_TRACK_ID = int(np.iinfo(np.uint16).max)
 _TRACKING_DTYPE = np.uint32
 _STRUCTURE_3X3_BOOL = np.ones((3, 3), dtype=bool)
+_RAM_STACK_SAFETY_FACTOR = 1.25
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +389,102 @@ def _memmap_nbytes(shape: tuple[int, ...], dtype) -> int:
         item_count *= dim
 
     return max(item_count * np.dtype(dtype).itemsize, 1)
+
+
+def _available_memory_bytes() -> int | None:
+    """Return currently available physical RAM when stdlib can detect it."""
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullAvailPhys)
+        except Exception:
+            return None
+
+    if hasattr(os, "sysconf"):
+        try:
+            available_pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError):
+            return None
+        if available_pages > 0 and page_size > 0:
+            return int(available_pages) * int(page_size)
+
+    return None
+
+
+def _ensure_ram_stack_capacity(
+    estimated_stack_bytes: int,
+    available_memory_bytes: int | None = None,
+    safety_factor: float = _RAM_STACK_SAFETY_FACTOR,
+) -> None:
+    available = _available_memory_bytes() if available_memory_bytes is None else available_memory_bytes
+    if available is None:
+        return
+
+    required_bytes = max(
+        int(estimated_stack_bytes),
+        int(estimated_stack_bytes * safety_factor),
+    )
+    if int(available) >= required_bytes:
+        return
+
+    raise RuntimeError(
+        "RAM tracking stack requires at least "
+        f"{_format_gib(required_bytes)} available RAM "
+        f"(stack={_format_gib(estimated_stack_bytes)}, safety_factor={safety_factor:.2f}), "
+        f"but only {_format_gib(int(available))} is available. "
+        "No automatic mmap fallback is used; reduce the frame range/image size or rerun "
+        "with --stack-storage mmap and an explicit local scratch disk."
+    )
+
+
+def _create_tracking_stack(
+    stack_storage: str,
+    path: Path,
+    dtype,
+    shape: tuple[int, ...],
+    estimated_stack_bytes: int | None = None,
+    available_memory_bytes: int | None = None,
+) -> np.ndarray:
+    if estimated_stack_bytes is None:
+        estimated_stack_bytes = _memmap_nbytes(shape, dtype)
+
+    if stack_storage == "ram":
+        _ensure_ram_stack_capacity(
+            estimated_stack_bytes=estimated_stack_bytes,
+            available_memory_bytes=available_memory_bytes,
+        )
+        try:
+            return np.empty(shape, dtype=dtype)
+        except MemoryError as exc:
+            raise RuntimeError(
+                "Could not allocate RAM tracking stack "
+                f"({_format_gib(estimated_stack_bytes)}). "
+                "No automatic mmap fallback is used; reduce the frame range/image size or rerun "
+                "with --stack-storage mmap and an explicit local scratch disk."
+            ) from exc
+
+    if stack_storage == "mmap":
+        return _create_tracking_memmap(path, dtype=dtype, shape=shape)
+
+    raise ValueError("stack_storage must be 'ram' or 'mmap'.")
 
 
 def _create_tracking_memmap(path: Path, dtype, shape: tuple[int, ...]) -> np.memmap:
@@ -1618,6 +1715,7 @@ def run_tracking(
     io_workers: int = 1,
     io_queue_depth: int = 4,
     tiff_write_workers: int = 4,
+    stack_storage: str = "ram",
     mmap_dir: Path | None = None,
     export_mode: str = "full",
     final_output_dir: Path | None = None,
@@ -1644,6 +1742,10 @@ def run_tracking(
         raise ValueError("Challenge export requires resiz_factor=1.0 to preserve original image geometry.")
     if division_cooldown_frames < 0:
         raise ValueError("division_cooldown_frames must be >= 0.")
+    if stack_storage not in {"ram", "mmap"}:
+        raise ValueError("stack_storage must be 'ram' or 'mmap'.")
+    if mmap_dir is not None and stack_storage != "mmap":
+        raise ValueError("--mmap-dir requires --stack-storage mmap.")
     if export_mode not in {"full", "final-only"}:
         raise ValueError("export_mode must be 'full' or 'final-only'.")
     if export_mode == "final-only":
@@ -1683,6 +1785,7 @@ def run_tracking(
         f.write(f"io_workers={io_workers}\n")
         f.write(f"io_queue_depth={io_queue_depth}\n")
         f.write(f"tiff_write_workers={tiff_write_workers}\n")
+        f.write(f"stack_storage={stack_storage}\n")
         f.write(f"mmap_dir={mmap_dir if mmap_dir is not None else 'auto'}\n")
         f.write(f"export_mode={export_mode}\n")
         if export_mode == "final-only":
@@ -1712,23 +1815,33 @@ def run_tracking(
 
     bytes_per_frame = frame_shape[0] * frame_shape[1] * np.dtype(_TRACKING_DTYPE).itemsize
     estimated_stack_bytes = bytes_per_frame * im_no
-    mmap_root = _choose_mmap_dir(output_dir, mmap_dir, estimated_stack_bytes)
-    tracked_stack_path = mmap_root / f"{pos}_tracked_stack_{time.time_ns()}.{np.dtype(_TRACKING_DTYPE).name}.mmap"
-    print(
-        f"[TRACKING] low-memory mode: disk-backed stack={tracked_stack_path} "
-        f"dtype={np.dtype(_TRACKING_DTYPE).name} shape={frame_shape} "
-        f"frames={im_no} estimated_size={_format_gib(estimated_stack_bytes)}"
-    )
+    tracked_stack_path = output_dir / f"{pos}_tracked_stack_{time.time_ns()}.{np.dtype(_TRACKING_DTYPE).name}.mmap"
+    if stack_storage == "mmap":
+        mmap_root = _choose_mmap_dir(output_dir, mmap_dir, estimated_stack_bytes)
+        tracked_stack_path = mmap_root / tracked_stack_path.name
+        print(
+            f"[TRACKING] low-memory mode: disk-backed stack={tracked_stack_path} "
+            f"dtype={np.dtype(_TRACKING_DTYPE).name} shape={frame_shape} "
+            f"frames={im_no} estimated_size={_format_gib(estimated_stack_bytes)}"
+        )
+    else:
+        print(
+            f"[TRACKING] RAM stack mode: dtype={np.dtype(_TRACKING_DTYPE).name} "
+            f"shape={frame_shape} frames={im_no} "
+            f"estimated_size={_format_gib(estimated_stack_bytes)}"
+        )
 
     tracked_stack = None
     mask0 = None
     final_tracked_tensor = None
     mask_2_change = None
     try:
-        tracked_stack = _create_tracking_memmap(
-            tracked_stack_path,
+        tracked_stack = _create_tracking_stack(
+            stack_storage=stack_storage,
+            path=tracked_stack_path,
             dtype=_TRACKING_DTYPE,
             shape=(frame_shape[0], frame_shape[1], im_no),
+            estimated_stack_bytes=estimated_stack_bytes,
         )
 
         is1 = np.copy(first_mask).astype(_TRACKING_DTYPE)
@@ -2009,7 +2122,8 @@ def run_tracking(
         elapsed_time = time.time() - tic
         print(f"[TRACKING] main_loop_elapsed={elapsed_time:.2f}s")
         prefetcher.stop()
-        tracked_stack.flush()
+        if isinstance(tracked_stack, np.memmap):
+            tracked_stack.flush()
 
         print("[TRACKING] post: compacting raw tracker labels", flush=True)
         mask0 = tracked_stack
@@ -2147,7 +2261,7 @@ def run_tracking(
             f"res_track_rows={track_count} result_dir={result_dir}"
         )
     finally:
-        if tracked_stack is not None:
+        if isinstance(tracked_stack, np.memmap):
             tracked_stack.flush()
 
         # Ensure all memmap references are dropped before attempting to remove the backing file.
@@ -2157,7 +2271,7 @@ def run_tracking(
         tracked_stack = None
         gc.collect()
 
-        if tracked_stack_path.exists():
+        if stack_storage == "mmap" and tracked_stack_path.exists():
             removed = False
             for retry_idx in range(5):
                 try:
@@ -2277,6 +2391,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--stack-storage",
+        choices=["ram", "mmap"],
+        default="ram",
+        help=(
+            "Where to store the full working tracking stack. ram keeps it in process memory "
+            "and fails clearly if RAM is insufficient; mmap uses a disk-backed temporary file. "
+            "Default: ram."
+        ),
+    )
+    parser.add_argument(
         "--mmap-dir",
         default=None,
         type=Path,
@@ -2378,6 +2502,7 @@ def main():
         io_workers=args.io_workers,
         io_queue_depth=args.io_queue_depth,
         tiff_write_workers=args.tiff_write_workers,
+        stack_storage=args.stack_storage,
         mmap_dir=mmap_dir,
         export_mode=args.export_mode,
         final_output_dir=final_output_dir,

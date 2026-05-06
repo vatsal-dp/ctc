@@ -47,6 +47,7 @@ CELLPOSE_EXTRA_ARGS=()
 
 TRACKING_SCRIPT="$SCRIPT_DIR/ram_run_tiptracking_standalone_optimized.py"
 TIME_SERIES_THRESHOLD=1
+TRACKING_STACK_STORAGE="ram"
 TRACKING_MMAP_DIR=""
 TRACKING_IO_WORKERS=1
 TRACKING_IO_QUEUE_DEPTH=4
@@ -119,7 +120,9 @@ Cellpose options:
 Tracking/downsampling options:
   --tracking-script PATH    Tracking runner. Default: ram_run_tiptracking_standalone_optimized.py.
   --time-series-threshold N Tracking time-series threshold. Default: 1.
-  --tracking-mmap-dir PATH  Temporary tracking stack scratch directory.
+  --tracking-stack-storage MODE
+                            ram or mmap for the full tracking stack. Default: ram.
+  --tracking-mmap-dir PATH  Temporary tracking stack scratch directory. Requires --tracking-stack-storage mmap.
   --tracking-io-workers N   Background TIFF read threads for tracking. Default: 1.
   --tracking-io-queue-depth N
                             Decoded mask prefetch queue depth for tracking. Default: 4.
@@ -651,6 +654,7 @@ parse_args() {
       --cellpose-extra-arg) CELLPOSE_EXTRA_ARGS+=("${2:?}"); shift 2 ;;
       --tracking-script) TRACKING_SCRIPT="${2:?}"; shift 2 ;;
       --time-series-threshold) TIME_SERIES_THRESHOLD="${2:?}"; shift 2 ;;
+      --tracking-stack-storage) TRACKING_STACK_STORAGE="${2:?}"; shift 2 ;;
       --tracking-mmap-dir) TRACKING_MMAP_DIR="$(path_arg "${2:?}")"; shift 2 ;;
       --tracking-io-workers) TRACKING_IO_WORKERS="${2:?}"; shift 2 ;;
       --tracking-io-queue-depth) TRACKING_IO_QUEUE_DEPTH="${2:?}"; shift 2 ;;
@@ -701,6 +705,16 @@ validate_args() {
   validate_env_options
   [[ -d "$DATASET_ROOT" ]] || die "dataset root does not exist: $DATASET_ROOT"
   [[ -f "$TRACKING_SCRIPT" ]] || die "tracking script does not exist: $TRACKING_SCRIPT"
+  case "$TRACKING_STACK_STORAGE" in
+    ram|mmap)
+      ;;
+    *)
+      die "--tracking-stack-storage must be ram or mmap"
+      ;;
+  esac
+  if [[ -n "$TRACKING_MMAP_DIR" && "$TRACKING_STACK_STORAGE" != "mmap" ]]; then
+    die "--tracking-mmap-dir requires --tracking-stack-storage mmap"
+  fi
   case "$TRACKING_EXPORT_MODE" in
     final-only|full)
       ;;
@@ -822,6 +836,7 @@ run_sequence() {
       --io-workers "$TRACKING_IO_WORKERS" \
       --io-queue-depth "$TRACKING_IO_QUEUE_DEPTH" \
       --tiff-write-workers "$TRACKING_TIFF_WRITE_WORKERS" \
+      --stack-storage "$TRACKING_STACK_STORAGE" \
       --export-mode "$effective_tracking_export_mode"
     )
     if [[ "$effective_tracking_export_mode" == "final-only" ]]; then

@@ -76,6 +76,86 @@ class CTCPipelineToolTests(unittest.TestCase):
                 finally:
                     tracked_stack._mmap.close()
 
+    def test_ram_tracking_stack_uses_numpy_array_not_memmap(self):
+        create_stack = getattr(ram_tracking, "_create_tracking_stack", None)
+        self.assertIsNotNone(create_stack)
+
+        original_memmap_type = np.memmap
+        shape = (2, 3, 4)
+        dtype = np.uint32
+        with tempfile.TemporaryDirectory() as tmp:
+            stack_path = Path(tmp) / "tracked.uint32.mmap"
+            with mock.patch.object(
+                ram_tracking.np,
+                "memmap",
+                wraps=ram_tracking.np.memmap,
+            ) as memmap_mock:
+                tracked_stack = create_stack(
+                    stack_storage="ram",
+                    path=stack_path,
+                    dtype=dtype,
+                    shape=shape,
+                    estimated_stack_bytes=int(np.prod(shape)) * np.dtype(dtype).itemsize,
+                    available_memory_bytes=1024 * 1024,
+                )
+
+        self.assertIsInstance(tracked_stack, np.ndarray)
+        self.assertFalse(isinstance(tracked_stack, original_memmap_type))
+        self.assertEqual(tracked_stack.shape, shape)
+        self.assertEqual(tracked_stack.dtype, np.dtype(dtype))
+        self.assertEqual(memmap_mock.call_count, 0)
+        self.assertFalse(stack_path.exists())
+
+    def test_mmap_tracking_stack_uses_presized_memmap(self):
+        create_stack = getattr(ram_tracking, "_create_tracking_stack", None)
+        self.assertIsNotNone(create_stack)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mmap_path = Path(tmp) / "tracked.uint32.mmap"
+            shape = (3, 4, 5)
+            dtype = np.uint32
+            expected_nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+
+            with mock.patch.object(
+                ram_tracking.np,
+                "memmap",
+                wraps=ram_tracking.np.memmap,
+            ) as memmap_mock:
+                tracked_stack = create_stack(
+                    stack_storage="mmap",
+                    path=mmap_path,
+                    dtype=dtype,
+                    shape=shape,
+                    estimated_stack_bytes=expected_nbytes,
+                    available_memory_bytes=1,
+                )
+                try:
+                    self.assertEqual(mmap_path.stat().st_size, expected_nbytes)
+                    self.assertEqual(tracked_stack.shape, shape)
+                    self.assertEqual(tracked_stack.dtype, np.dtype(dtype))
+                    self.assertEqual(memmap_mock.call_args.kwargs["mode"], "r+")
+                finally:
+                    tracked_stack._mmap.close()
+
+    def test_ram_tracking_stack_preflight_rejects_insufficient_memory(self):
+        create_stack = getattr(ram_tracking, "_create_tracking_stack", None)
+        self.assertIsNotNone(create_stack)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stack_path = Path(tmp) / "tracked.uint32.mmap"
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "RAM tracking stack requires .*available RAM",
+            ):
+                create_stack(
+                    stack_storage="ram",
+                    path=stack_path,
+                    dtype=np.uint32,
+                    shape=(100, 100, 100),
+                    estimated_stack_bytes=100 * 100 * 100 * np.dtype(np.uint32).itemsize,
+                    available_memory_bytes=1024,
+                )
+
     def test_output_digits_auto_and_bounds(self):
         self.assertEqual(_resolve_output_digits("auto", [Path("mask000.tif")], 2), 3)
         self.assertEqual(_resolve_output_digits("auto", [Path("mask0000.tif")], 2), 4)
