@@ -46,6 +46,7 @@ SEG_MASK_PATTERN="*_cp_masks.tif"
 CELLPOSE_EXTRA_ARGS=()
 
 TRACKING_SCRIPT="$SCRIPT_DIR/ram_run_tiptracking_standalone_optimized.py"
+BLOCKWISE_TRACKING_SCRIPT="$SCRIPT_DIR/blockwise_tiptracking.py"
 TIME_SERIES_THRESHOLD=1
 TRACKING_STACK_STORAGE="ram"
 TRACKING_MMAP_DIR=""
@@ -53,6 +54,11 @@ TRACKING_IO_WORKERS=1
 TRACKING_IO_QUEUE_DEPTH=4
 TRACKING_TIFF_WRITE_WORKERS=4
 TRACKING_EXPORT_MODE="final-only"
+TRACKING_BLOCKWISE=0
+TRACKING_BLOCK_SIZE=1000
+TRACKING_BLOCK_OVERLAP=100
+TRACKING_BLOCK_JOBS=1
+TRACKING_KEEP_BLOCK_WORK=0
 TRACK_OUTPUT_DIGITS="auto"
 FINAL_OUTPUT_DIGITS="auto"
 TEMPORAL_DOWNSAMPLE_OFFSET=0
@@ -130,6 +136,13 @@ Tracking/downsampling options:
                             TIFF output write threads for tracking. Default: 4.
   --tracking-export-mode MODE
                             final-only or full. Default: final-only.
+  --tracking-block-size N   Enable blockwise tracking with N owned frames per block.
+                            Default when blockwise is enabled: 1000.
+  --tracking-block-overlap N
+                            Overlap frames on each side of each tracked block. Default: 100.
+  --tracking-block-jobs N   Number of block tracker processes to run concurrently. Default: 1.
+  --tracking-keep-block-work
+                            Keep per-block inputs, logs, and <block>_RES outputs after merging.
   --track-output-digits N   Intermediate tracking mask digit width. Default: auto.
   --output-digits N         Final mask digit width. Default: auto.
   --downsample-offset N     First interpolated frame to keep. Default: 0.
@@ -660,6 +673,10 @@ parse_args() {
       --tracking-io-queue-depth) TRACKING_IO_QUEUE_DEPTH="${2:?}"; shift 2 ;;
       --tracking-tiff-write-workers) TRACKING_TIFF_WRITE_WORKERS="${2:?}"; shift 2 ;;
       --tracking-export-mode) TRACKING_EXPORT_MODE="${2:?}"; shift 2 ;;
+      --tracking-block-size) TRACKING_BLOCKWISE=1; TRACKING_BLOCK_SIZE="${2:?}"; shift 2 ;;
+      --tracking-block-overlap) TRACKING_BLOCKWISE=1; TRACKING_BLOCK_OVERLAP="${2:?}"; shift 2 ;;
+      --tracking-block-jobs) TRACKING_BLOCKWISE=1; TRACKING_BLOCK_JOBS="${2:?}"; shift 2 ;;
+      --tracking-keep-block-work) TRACKING_BLOCKWISE=1; TRACKING_KEEP_BLOCK_WORK=1; shift ;;
       --track-output-digits) TRACK_OUTPUT_DIGITS="${2:?}"; shift 2 ;;
       --output-digits) FINAL_OUTPUT_DIGITS="${2:?}"; shift 2 ;;
       --downsample-offset) TEMPORAL_DOWNSAMPLE_OFFSET="${2:?}"; shift 2 ;;
@@ -705,6 +722,9 @@ validate_args() {
   validate_env_options
   [[ -d "$DATASET_ROOT" ]] || die "dataset root does not exist: $DATASET_ROOT"
   [[ -f "$TRACKING_SCRIPT" ]] || die "tracking script does not exist: $TRACKING_SCRIPT"
+  if [[ "$TRACKING_BLOCKWISE" -eq 1 ]]; then
+    [[ -f "$BLOCKWISE_TRACKING_SCRIPT" ]] || die "blockwise tracking script does not exist: $BLOCKWISE_TRACKING_SCRIPT"
+  fi
   case "$TRACKING_STACK_STORAGE" in
     ram|mmap)
       ;;
@@ -722,6 +742,20 @@ validate_args() {
       die "--tracking-export-mode must be final-only or full"
       ;;
   esac
+  if [[ "$TRACKING_BLOCKWISE" -eq 1 ]]; then
+    if ! [[ "$TRACKING_BLOCK_SIZE" =~ ^[0-9]+$ ]] || [[ "$TRACKING_BLOCK_SIZE" -lt 1 ]]; then
+      die "--tracking-block-size must be a positive integer"
+    fi
+    if ! [[ "$TRACKING_BLOCK_OVERLAP" =~ ^[0-9]+$ ]]; then
+      die "--tracking-block-overlap must be a non-negative integer"
+    fi
+    if [[ "$TRACKING_BLOCK_OVERLAP" -ge "$TRACKING_BLOCK_SIZE" ]]; then
+      die "--tracking-block-overlap must be smaller than --tracking-block-size"
+    fi
+    if ! [[ "$TRACKING_BLOCK_JOBS" =~ ^[0-9]+$ ]] || [[ "$TRACKING_BLOCK_JOBS" -lt 1 ]]; then
+      die "--tracking-block-jobs must be a positive integer"
+    fi
+  fi
 
   if [[ -z "$FILM_CYCLES" ]]; then
     FILM_CYCLES="$(cycles_for_factor "$INTERPOLATION_FACTOR")"
@@ -825,8 +859,12 @@ run_sequence() {
     local mask_dir
     mask_dir="$(resolve_mask_dir "$interpolated_dir" "$CELLPOSE_MASK_DIR")"
     log "segmentation masks: $mask_dir pattern=$SEG_MASK_PATTERN"
+    local tracking_entrypoint="$TRACKING_SCRIPT"
+    if [[ "$TRACKING_BLOCKWISE" -eq 1 ]]; then
+      tracking_entrypoint="$BLOCKWISE_TRACKING_SCRIPT"
+    fi
     local -a tracking_cmd=(
-      "$PYTHON_BIN" "$TRACKING_SCRIPT" \
+      "$PYTHON_BIN" "$tracking_entrypoint" \
       --mask-dir "$mask_dir" \
       --mask-pattern "$SEG_MASK_PATTERN" \
       --output-dir "$tracking_root" \
@@ -839,6 +877,18 @@ run_sequence() {
       --stack-storage "$TRACKING_STACK_STORAGE" \
       --export-mode "$effective_tracking_export_mode"
     )
+    if [[ "$TRACKING_BLOCKWISE" -eq 1 ]]; then
+      tracking_cmd+=(
+        --tracking-script "$TRACKING_SCRIPT"
+        --block-size "$TRACKING_BLOCK_SIZE"
+        --overlap "$TRACKING_BLOCK_OVERLAP"
+        --jobs "$TRACKING_BLOCK_JOBS"
+        --python "$PYTHON_BIN"
+      )
+      if [[ "$TRACKING_KEEP_BLOCK_WORK" -eq 1 ]]; then
+        tracking_cmd+=(--keep-block-work)
+      fi
+    fi
     if [[ "$effective_tracking_export_mode" == "final-only" ]]; then
       tracking_cmd+=(
         --final-output-dir "$final_result_dir"

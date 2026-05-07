@@ -31,6 +31,10 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         self.assertIn("--tracking-io-workers", result.stdout)
         self.assertIn("--tracking-tiff-write-workers", result.stdout)
         self.assertIn("--tracking-export-mode", result.stdout)
+        self.assertIn("--tracking-block-size", result.stdout)
+        self.assertIn("--tracking-block-overlap", result.stdout)
+        self.assertIn("--tracking-block-jobs", result.stdout)
+        self.assertIn("--tracking-keep-block-work", result.stdout)
 
     def test_help_documents_environment_bootstrap_options(self):
         result = subprocess.run(
@@ -307,6 +311,60 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, msg=result.stdout)
             self.assertIn("--export-mode full", result.stdout)
             self.assertIn("temporal_downsample_ctc_results.py", result.stdout)
+
+    def test_dry_run_blockwise_tracking_uses_wrapper_and_forwards_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = root / "BF-C2DL-HSC"
+            work_root = root / "work"
+            output_root = root / "submission"
+            cellpose_model = root / "cellpose_model"
+            for folder in [dataset_root / "02", cellpose_model]:
+                folder.mkdir(parents=True)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT),
+                    "--dataset-root",
+                    str(dataset_root),
+                    "--work-root",
+                    str(work_root),
+                    "--output-root",
+                    str(output_root),
+                    "--cellpose-model",
+                    str(cellpose_model),
+                    "--sequences",
+                    "02",
+                    "--stage-gt",
+                    "none",
+                    "--skip-validation",
+                    "--tracking-block-size",
+                    "1000",
+                    "--tracking-block-overlap",
+                    "100",
+                    "--tracking-block-jobs",
+                    "2",
+                    "--tracking-keep-block-work",
+                    "--dry-run",
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stdout)
+            self.assertIn("blockwise_tiptracking.py", result.stdout)
+            self.assertIn("--block-size 1000", result.stdout)
+            self.assertIn("--overlap 100", result.stdout)
+            self.assertIn("--jobs 2", result.stdout)
+            self.assertIn("--keep-block-work", result.stdout)
+            self.assertIn("--tracking-script", result.stdout)
+            self.assertIn("ram_run_tiptracking_standalone_optimized.py", result.stdout)
+            self.assertIn("--export-mode final-only", result.stdout)
+            self.assertIn("--final-output-dir", result.stdout)
+            self.assertIn("skip temporal downsample for 02; tracking wrote final-only result", result.stdout)
 
     def test_missing_cellpose_module_fails_before_interpolation(self):
         with tempfile.TemporaryDirectory() as tmp:

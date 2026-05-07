@@ -13,6 +13,7 @@ import tifffile
 from analyze_tracking_failures import analyze_failures
 from evaluate_ctc_results import summarize_official_logs
 import ram_run_tiptracking_standalone_optimized as ram_tracking
+from blockwise_tiptracking import BlockResult, BlockRange, build_block_ranges, merge_block_results
 from run_ctc_training_pipeline import _run_sequence, _tracking_position_for_sequence
 from run_tiptracking_standalone import (
     _compact_labels_in_place,
@@ -654,6 +655,155 @@ class CTCPipelineToolTests(unittest.TestCase):
         image_dir.mkdir(parents=True)
         for frame_idx in range(start, start + frame_count):
             tifffile.imwrite(image_dir / f"t{frame_idx:03d}.tif", np.zeros(shape, dtype=np.uint16))
+
+    def _write_block_result(self, result_dir: Path, masks: list[np.ndarray], rows: str):
+        result_dir.mkdir(parents=True)
+        for frame_idx, mask in enumerate(masks):
+            tifffile.imwrite(result_dir / f"mask{frame_idx:03d}.tif", mask.astype(np.uint16, copy=False))
+        (result_dir / "res_track.txt").write_text(rows, encoding="utf-8")
+
+    def test_blockwise_ranges_cover_long_short_exact_and_partial_sequences(self):
+        short = build_block_ranges(frame_count=850, block_size=1000, overlap=100)
+        self.assertEqual(short, [BlockRange(index=0, run_start=0, run_end=849, owned_start=0, owned_end=849)])
+
+        exact = build_block_ranges(frame_count=2000, block_size=1000, overlap=100)
+        self.assertEqual(exact, [
+            BlockRange(index=0, run_start=0, run_end=1099, owned_start=0, owned_end=999),
+            BlockRange(index=1, run_start=900, run_end=1999, owned_start=1000, owned_end=1999),
+        ])
+
+        long = build_block_ranges(frame_count=27001, block_size=1000, overlap=100)
+        self.assertEqual(len(long), 28)
+        self.assertEqual(long[0], BlockRange(index=0, run_start=0, run_end=1099, owned_start=0, owned_end=999))
+        self.assertEqual(long[1], BlockRange(index=1, run_start=900, run_end=2099, owned_start=1000, owned_end=1999))
+        self.assertEqual(long[-1], BlockRange(index=27, run_start=26900, run_end=27000, owned_start=27000, owned_end=27000))
+
+    def test_blockwise_merge_stitches_same_object_across_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            block0 = root / "block0_RES"
+            block1 = root / "block1_RES"
+            output = root / "01_RES"
+            source = root / "source"
+            self._write_source_frames(source, "01", frame_count=5, shape=(8, 8))
+
+            mask_a = np.zeros((8, 8), dtype=np.uint16)
+            mask_a[1:4, 1:4] = 1
+            self._write_block_result(block0, [mask_a.copy(), mask_a.copy(), mask_a.copy(), mask_a.copy()], "1 0 3 0\n")
+
+            mask_b = np.zeros((8, 8), dtype=np.uint16)
+            mask_b[1:4, 1:4] = 7
+            self._write_block_result(block1, [mask_b.copy(), mask_b.copy(), mask_b.copy(), mask_b.copy()], "7 0 3 0\n")
+
+            report = merge_block_results(
+                [
+                    BlockResult(block=BlockRange(0, 0, 3, 0, 1), result_dir=block0),
+                    BlockResult(block=BlockRange(1, 1, 4, 2, 4), result_dir=block1),
+                ],
+                output_result_dir=output,
+                output_digits="3",
+                min_iou=0.50,
+                min_overlap_frames=1,
+            )
+
+            self.assertEqual(report["frames"], 5)
+            self.assertEqual(report["tracks"], 1)
+            self.assertEqual((output / "res_track.txt").read_text(encoding="utf-8"), "1 0 4 0\n")
+            for frame_idx in range(5):
+                self.assertEqual(set(np.unique(tifffile.imread(output / f"mask{frame_idx:03d}.tif")).tolist()), {0, 1})
+            validation = validate_ctc_result_format(
+                dataset_root=output.parent,
+                source_root=source,
+                sequence="01",
+                digits_arg="auto",
+            )
+            self.assertEqual(validation["frames"], 5)
+            self.assertEqual(validation["tracks"], 1)
+
+    def test_blockwise_merge_assigns_new_id_for_unmatched_boundary_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            block0 = root / "block0_RES"
+            block1 = root / "block1_RES"
+            output = root / "01_RES"
+
+            old_mask = np.zeros((8, 8), dtype=np.uint16)
+            old_mask[1:4, 1:4] = 1
+            new_mask = np.zeros((8, 8), dtype=np.uint16)
+            new_mask[4:7, 4:7] = 7
+            self._write_block_result(block0, [old_mask.copy(), old_mask.copy()], "1 0 1 0\n")
+            self._write_block_result(block1, [new_mask.copy(), new_mask.copy()], "7 0 1 0\n")
+
+            report = merge_block_results(
+                [
+                    BlockResult(block=BlockRange(0, 0, 1, 0, 0), result_dir=block0),
+                    BlockResult(block=BlockRange(1, 0, 1, 1, 1), result_dir=block1),
+                ],
+                output_result_dir=output,
+                output_digits="3",
+                min_iou=0.50,
+                min_overlap_frames=1,
+            )
+
+            self.assertEqual(report["tracks"], 2)
+            self.assertEqual((output / "res_track.txt").read_text(encoding="utf-8"), "1 0 0 0\n2 1 1 0\n")
+            self.assertEqual(set(np.unique(tifffile.imread(output / "mask000.tif")).tolist()), {0, 1})
+            self.assertEqual(set(np.unique(tifffile.imread(output / "mask001.tif")).tolist()), {0, 2})
+
+    def test_blockwise_merge_preserves_parent_row_from_owned_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            block0 = root / "block0_RES"
+            block1 = root / "block1_RES"
+            output = root / "01_RES"
+
+            parent = np.zeros((8, 8), dtype=np.uint16)
+            parent[1:4, 1:4] = 1
+            child = np.zeros((8, 8), dtype=np.uint16)
+            child[4:7, 4:7] = 2
+            self._write_block_result(block0, [parent.copy(), parent.copy()], "1 0 1 0\n")
+            self._write_block_result(block1, [parent.copy(), child.copy(), child.copy()], "1 0 0 0\n2 1 2 1\n")
+
+            merge_block_results(
+                [
+                    BlockResult(block=BlockRange(0, 0, 1, 0, 0), result_dir=block0),
+                    BlockResult(block=BlockRange(1, 0, 2, 1, 2), result_dir=block1),
+                ],
+                output_result_dir=output,
+                output_digits="3",
+                min_iou=0.50,
+                min_overlap_frames=1,
+            )
+
+            self.assertEqual((output / "res_track.txt").read_text(encoding="utf-8"), "1 0 0 0\n2 1 2 1\n")
+
+    def test_blockwise_merge_does_not_merge_ambiguous_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            block0 = root / "block0_RES"
+            block1 = root / "block1_RES"
+            output = root / "01_RES"
+
+            global_mask = np.zeros((8, 8), dtype=np.uint16)
+            global_mask[1:5, 1:5] = 1
+            ambiguous = np.zeros((8, 8), dtype=np.uint16)
+            ambiguous[1:3, 1:5] = 7
+            ambiguous[3:5, 1:5] = 8
+            self._write_block_result(block0, [global_mask.copy(), global_mask.copy()], "1 0 1 0\n")
+            self._write_block_result(block1, [ambiguous.copy(), ambiguous.copy()], "7 0 1 0\n8 0 1 0\n")
+
+            merge_block_results(
+                [
+                    BlockResult(block=BlockRange(0, 0, 1, 0, 0), result_dir=block0),
+                    BlockResult(block=BlockRange(1, 0, 1, 1, 1), result_dir=block1),
+                ],
+                output_result_dir=output,
+                output_digits="3",
+                min_iou=0.25,
+                min_overlap_frames=1,
+            )
+
+            self.assertEqual((output / "res_track.txt").read_text(encoding="utf-8"), "1 0 0 0\n2 1 1 0\n3 1 1 0\n")
 
     def test_temporal_downsample_selects_every_16th_frame_and_rebuilds_tracks(self):
         with tempfile.TemporaryDirectory() as tmp:
