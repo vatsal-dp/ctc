@@ -486,6 +486,12 @@ def _run_tracking_block(
         str(args.io_queue_depth),
         "--tiff-write-workers",
         str(args.tiff_write_workers),
+        "--identity-rescue-gap",
+        str(args.identity_rescue_gap),
+        "--rescue-confidence-threshold",
+        str(args.rescue_confidence_threshold),
+        "--max-centroid-dist-px",
+        str(args.max_centroid_dist_px),
         "--stack-storage",
         args.stack_storage,
         "--export-mode",
@@ -614,6 +620,9 @@ def parse_args():
     parser.add_argument("--io-workers", default=1, type=int)
     parser.add_argument("--io-queue-depth", default=4, type=int)
     parser.add_argument("--tiff-write-workers", default=4, type=int)
+    parser.add_argument("--identity-rescue-gap", default=1, type=int)
+    parser.add_argument("--rescue-confidence-threshold", default=0.50, type=float)
+    parser.add_argument("--max-centroid-dist-px", default=50.0, type=float)
     parser.add_argument("--stack-storage", choices=["ram", "mmap"], default="ram")
     parser.add_argument("--mmap-dir", default=None, type=Path)
     parser.add_argument("--export-mode", choices=["full", "final-only"], default="full")
@@ -642,6 +651,12 @@ def _validate_args(args):
         raise ValueError("--min-overlap-frames must be a positive integer.")
     if not (0 < args.min_iou <= 1):
         raise ValueError("--min-iou must be in the range (0, 1].")
+    if args.identity_rescue_gap < 0:
+        raise ValueError("--identity-rescue-gap must be >= 0.")
+    if not (0 <= args.rescue_confidence_threshold <= 1):
+        raise ValueError("--rescue-confidence-threshold must be in the range [0, 1].")
+    if args.max_centroid_dist_px < 0:
+        raise ValueError("--max-centroid-dist-px must be >= 0.")
     if not args.tracking_script.is_file():
         raise FileNotFoundError(f"tracking-script does not exist: {args.tracking_script}")
     if args.mmap_dir is not None and args.stack_storage != "mmap":

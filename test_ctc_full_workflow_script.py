@@ -35,6 +35,9 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         self.assertIn("--tracking-block-overlap", result.stdout)
         self.assertIn("--tracking-block-jobs", result.stdout)
         self.assertIn("--tracking-keep-block-work", result.stdout)
+        self.assertIn("--tracking-identity-rescue-gap", result.stdout)
+        self.assertIn("--tracking-rescue-confidence-threshold", result.stdout)
+        self.assertIn("--tracking-max-centroid-dist-px", result.stdout)
 
     def test_help_documents_environment_bootstrap_options(self):
         result = subprocess.run(
@@ -346,6 +349,12 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
                     "--tracking-block-jobs",
                     "2",
                     "--tracking-keep-block-work",
+                    "--tracking-identity-rescue-gap",
+                    "1",
+                    "--tracking-rescue-confidence-threshold",
+                    "0.50",
+                    "--tracking-max-centroid-dist-px",
+                    "50",
                     "--dry-run",
                 ],
                 check=False,
@@ -360,6 +369,9 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn("--overlap 100", result.stdout)
             self.assertIn("--jobs 2", result.stdout)
             self.assertIn("--keep-block-work", result.stdout)
+            self.assertIn("--identity-rescue-gap 1", result.stdout)
+            self.assertIn("--rescue-confidence-threshold 0.50", result.stdout)
+            self.assertIn("--max-centroid-dist-px 50", result.stdout)
             self.assertIn("--tracking-script", result.stdout)
             self.assertIn("ram_run_tiptracking_standalone_optimized.py", result.stdout)
             self.assertIn("--export-mode final-only", result.stdout)

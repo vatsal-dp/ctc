@@ -14,6 +14,7 @@ opt-in identity rescue pass.
 
 import argparse
 import concurrent.futures
+import csv
 import gc
 import os
 import queue
@@ -1117,6 +1118,67 @@ def _log_rescue_summary(audit_log: list, label: str = "identity-continuity rescu
         )
 
 
+_IDENTITY_RESCUE_AUDIT_FIELDS = [
+    "stage",
+    "event",
+    "frame",
+    "lost_id",
+    "rescued_from",
+    "best_candidate",
+    "best_score",
+    "second_score",
+    "threshold",
+    "cooldown",
+    "frames_updated",
+]
+
+
+def _write_identity_rescue_audit(audit_path: Path, audit_log: list, stage: str) -> None:
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    with audit_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_IDENTITY_RESCUE_AUDIT_FIELDS)
+        writer.writeheader()
+        for event in audit_log:
+            row = {field: "" for field in _IDENTITY_RESCUE_AUDIT_FIELDS}
+            row["stage"] = stage
+            for key, value in event.items():
+                if key in row:
+                    row[key] = value
+            writer.writerow(row)
+
+
+def _rescue_identity_before_discontinuity_split(
+    mask_stack: np.ndarray,
+    identity_rescue_gap: int,
+    rescue_confidence_threshold: float,
+    max_centroid_dist_px: float,
+    audit_log: list | None = None,
+) -> list:
+    if identity_rescue_gap < 0:
+        raise ValueError("identity_rescue_gap must be >= 0.")
+    if rescue_confidence_threshold < 0 or rescue_confidence_threshold > 1:
+        raise ValueError("rescue_confidence_threshold must be in [0, 1].")
+    if max_centroid_dist_px < 0:
+        raise ValueError("max_centroid_dist_px must be >= 0.")
+
+    if audit_log is None:
+        audit_log = []
+    if identity_rescue_gap == 0 or mask_stack.size == 0 or int(np.max(mask_stack)) == 0:
+        return audit_log
+
+    print("[TRACKING] post: running identity-continuity rescue before discontinuity splitting", flush=True)
+    _rescue_identity_continuity(
+        normalized_tensor=mask_stack,
+        cooldown_until={},
+        max_rescue_gap=identity_rescue_gap,
+        rescue_confidence_threshold=rescue_confidence_threshold,
+        max_centroid_dist_px=max_centroid_dist_px,
+        audit_log=audit_log,
+    )
+    _log_rescue_summary(audit_log, label="pre-split identity rescue")
+    return audit_log
+
+
 def _normalize_ctc_divisions(
     final_tracked_tensor: np.ndarray,
     division_cooldown_frames: int = 20,
@@ -2191,6 +2253,19 @@ def run_tracking(
                 flush=True,
             )
         else:
+            if identity_rescue_gap > 0:
+                pre_split_audit: list = []
+                _rescue_identity_before_discontinuity_split(
+                    mask_stack=mask0,
+                    identity_rescue_gap=identity_rescue_gap,
+                    rescue_confidence_threshold=rescue_confidence_threshold,
+                    max_centroid_dist_px=max_centroid_dist_px,
+                    audit_log=pre_split_audit,
+                )
+                audit_path = result_dir / "identity_rescue_audit.csv"
+                _write_identity_rescue_audit(audit_path, pre_split_audit, stage="pre_split")
+                print(f"[TRACKING] post: wrote identity rescue audit={audit_path}", flush=True)
+
             print("[TRACKING] post: preparing downsampled mask stack", flush=True)
             max_id = raw_track_count
             numb_m1 = int(mask0.shape[2])

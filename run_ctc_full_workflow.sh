@@ -53,6 +53,9 @@ TRACKING_MMAP_DIR=""
 TRACKING_IO_WORKERS=1
 TRACKING_IO_QUEUE_DEPTH=4
 TRACKING_TIFF_WRITE_WORKERS=4
+TRACKING_IDENTITY_RESCUE_GAP=1
+TRACKING_RESCUE_CONFIDENCE_THRESHOLD="0.50"
+TRACKING_MAX_CENTROID_DIST_PX="50"
 TRACKING_EXPORT_MODE="final-only"
 TRACKING_BLOCKWISE=0
 TRACKING_BLOCK_SIZE=1000
@@ -134,6 +137,12 @@ Tracking/downsampling options:
                             Decoded mask prefetch queue depth for tracking. Default: 4.
   --tracking-tiff-write-workers N
                             TIFF output write threads for tracking. Default: 4.
+  --tracking-identity-rescue-gap N
+                            Frames ahead for conservative ID rescue before CTC gap splitting. Default: 1.
+  --tracking-rescue-confidence-threshold N
+                            Minimum identity rescue score in [0,1]. Default: 0.50.
+  --tracking-max-centroid-dist-px N
+                            Hard centroid-distance limit for identity rescue. Default: 50.
   --tracking-export-mode MODE
                             final-only or full. Default: final-only.
   --tracking-block-size N   Enable blockwise tracking with N owned frames per block.
@@ -672,6 +681,9 @@ parse_args() {
       --tracking-io-workers) TRACKING_IO_WORKERS="${2:?}"; shift 2 ;;
       --tracking-io-queue-depth) TRACKING_IO_QUEUE_DEPTH="${2:?}"; shift 2 ;;
       --tracking-tiff-write-workers) TRACKING_TIFF_WRITE_WORKERS="${2:?}"; shift 2 ;;
+      --tracking-identity-rescue-gap) TRACKING_IDENTITY_RESCUE_GAP="${2:?}"; shift 2 ;;
+      --tracking-rescue-confidence-threshold) TRACKING_RESCUE_CONFIDENCE_THRESHOLD="${2:?}"; shift 2 ;;
+      --tracking-max-centroid-dist-px) TRACKING_MAX_CENTROID_DIST_PX="${2:?}"; shift 2 ;;
       --tracking-export-mode) TRACKING_EXPORT_MODE="${2:?}"; shift 2 ;;
       --tracking-block-size) TRACKING_BLOCKWISE=1; TRACKING_BLOCK_SIZE="${2:?}"; shift 2 ;;
       --tracking-block-overlap) TRACKING_BLOCKWISE=1; TRACKING_BLOCK_OVERLAP="${2:?}"; shift 2 ;;
@@ -734,6 +746,9 @@ validate_args() {
   esac
   if [[ -n "$TRACKING_MMAP_DIR" && "$TRACKING_STACK_STORAGE" != "mmap" ]]; then
     die "--tracking-mmap-dir requires --tracking-stack-storage mmap"
+  fi
+  if ! [[ "$TRACKING_IDENTITY_RESCUE_GAP" =~ ^[0-9]+$ ]]; then
+    die "--tracking-identity-rescue-gap must be a non-negative integer"
   fi
   case "$TRACKING_EXPORT_MODE" in
     final-only|full)
@@ -874,6 +889,9 @@ run_sequence() {
       --io-workers "$TRACKING_IO_WORKERS" \
       --io-queue-depth "$TRACKING_IO_QUEUE_DEPTH" \
       --tiff-write-workers "$TRACKING_TIFF_WRITE_WORKERS" \
+      --identity-rescue-gap "$TRACKING_IDENTITY_RESCUE_GAP" \
+      --rescue-confidence-threshold "$TRACKING_RESCUE_CONFIDENCE_THRESHOLD" \
+      --max-centroid-dist-px "$TRACKING_MAX_CENTROID_DIST_PX" \
       --stack-storage "$TRACKING_STACK_STORAGE" \
       --export-mode "$effective_tracking_export_mode"
     )

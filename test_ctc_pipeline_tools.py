@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import csv
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ import tifffile
 from analyze_tracking_failures import analyze_failures
 from evaluate_ctc_results import summarize_official_logs
 import ram_run_tiptracking_standalone_optimized as ram_tracking
+import blockwise_tiptracking
 from blockwise_tiptracking import BlockResult, BlockRange, build_block_ranges, merge_block_results
 from run_ctc_training_pipeline import _run_sequence, _tracking_position_for_sequence
 from run_tiptracking_standalone import (
@@ -27,6 +29,7 @@ from ram_run_tiptracking_standalone_optimized import (
     _labels_are_dense_prefix,
     _looks_like_network_path,
     _normalize_ctc_divisions as _normalize_ctc_divisions_ram,
+    _prepare_challenge_tracks,
     _split_discontinuous_tracks as _split_discontinuous_tracks_ram,
 )
 from rescale_image_mask_pairs import rescale_dataset, resize_mask_array
@@ -251,6 +254,124 @@ class CTCPipelineToolTests(unittest.TestCase):
         self.assertEqual(capacity_pruned, 0)
         self.assertEqual(tp_im.shape[0], 5)
         self.assertEqual(mask_stack.reshape(-1).tolist(), [5, 0, 1, 0, 2])
+
+    def _run_ram_pre_split_rescue_then_split(
+        self,
+        mask_stack,
+        *,
+        identity_rescue_gap=1,
+        rescue_confidence_threshold=0.50,
+        max_centroid_dist_px=50.0,
+    ):
+        rescue = getattr(ram_tracking, "_rescue_identity_before_discontinuity_split", None)
+        self.assertIsNotNone(rescue)
+        audit_log = []
+        rescue(
+            mask_stack=mask_stack,
+            identity_rescue_gap=identity_rescue_gap,
+            rescue_confidence_threshold=rescue_confidence_threshold,
+            max_centroid_dist_px=max_centroid_dist_px,
+            audit_log=audit_log,
+        )
+        max_id = int(np.max(mask_stack)) if mask_stack.size else 0
+        tp_im = ram_tracking._build_tp_im(mask_stack, max_id) if max_id > 0 else np.zeros((0, 0), dtype=np.uint32)
+        tp1 = tp_im != 0
+        tp_im, tp1, short_pruned, capacity_pruned = _split_discontinuous_tracks_ram(
+            mask_stack=mask_stack,
+            tp_im=tp_im,
+            tp1=tp1,
+            time_series_threshold=1,
+        )
+        return tp_im, tp1, short_pruned, capacity_pruned, audit_log
+
+    def test_ram_pre_split_rescue_keeps_high_overlap_label_swap_as_one_track(self):
+        mask_stack = np.zeros((10, 10, 2), dtype=np.uint16)
+        mask_stack[2:7, 2:7, 0] = 1
+        mask_stack[2:7, 2:7, 1] = 2
+
+        tp_im, tp1, short_pruned, capacity_pruned, audit_log = self._run_ram_pre_split_rescue_then_split(mask_stack)
+
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 0)
+        self.assertEqual(int(np.count_nonzero(np.any(tp1, axis=1))), 1)
+        self.assertEqual(set(np.unique(mask_stack[:, :, 0]).tolist()), {0, 1})
+        self.assertEqual(set(np.unique(mask_stack[:, :, 1]).tolist()), {0, 1})
+        rescued = [entry for entry in audit_log if entry["event"] == "rescued"]
+        self.assertEqual(len(rescued), 1)
+        self.assertEqual(rescued[0]["lost_id"], 1)
+        self.assertEqual(rescued[0]["rescued_from"], 2)
+
+    def test_ram_pre_split_rescue_does_not_merge_low_overlap_new_object(self):
+        mask_stack = np.zeros((14, 14, 2), dtype=np.uint16)
+        mask_stack[1:5, 1:5, 0] = 1
+        mask_stack[9:13, 9:13, 1] = 2
+
+        tp_im, tp1, short_pruned, capacity_pruned, audit_log = self._run_ram_pre_split_rescue_then_split(mask_stack)
+
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 0)
+        self.assertEqual(int(np.count_nonzero(np.any(tp1, axis=1))), 2)
+        self.assertEqual(set(np.unique(mask_stack[:, :, 1]).tolist()), {0, 2})
+        self.assertFalse([entry for entry in audit_log if entry["event"] == "rescued"])
+
+    def test_ram_pre_split_rescue_rejects_ambiguous_candidates(self):
+        mask_stack = np.zeros((10, 10, 2), dtype=np.uint16)
+        mask_stack[2:8, 2:8, 0] = 1
+        mask_stack[2:5, 2:8, 1] = 2
+        mask_stack[5:8, 2:8, 1] = 3
+
+        tp_im, tp1, short_pruned, capacity_pruned, audit_log = self._run_ram_pre_split_rescue_then_split(mask_stack)
+
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 0)
+        self.assertEqual(int(np.count_nonzero(np.any(tp1, axis=1))), 3)
+        self.assertEqual(set(np.unique(mask_stack[:, :, 1]).tolist()), {0, 2, 3})
+        self.assertTrue([entry for entry in audit_log if entry["event"] == "skip_ambiguous"])
+
+    def test_ram_pre_split_rescue_leaves_real_missing_gap_split(self):
+        mask_stack = np.zeros((10, 10, 3), dtype=np.uint16)
+        mask_stack[2:7, 2:7, 0] = 1
+        mask_stack[2:7, 2:7, 2] = 2
+
+        tp_im, tp1, short_pruned, capacity_pruned, audit_log = self._run_ram_pre_split_rescue_then_split(
+            mask_stack,
+            identity_rescue_gap=2,
+        )
+
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 0)
+        self.assertEqual(int(np.count_nonzero(np.any(tp1, axis=1))), 2)
+        self.assertEqual(mask_stack.reshape(-1).tolist().count(1), 25)
+        self.assertEqual(mask_stack.reshape(-1).tolist().count(2), 25)
+        self.assertTrue([entry for entry in audit_log if entry["event"] == "rescued"])
+
+    def test_ram_pre_split_rescue_preserves_division_parent_rows(self):
+        mask_stack = self._division_stack(frame_count=3)
+        mask_stack[5:8, 2:8, 2] = 0
+        mask_stack[5:8, 2:8, 2] = 4
+        rescue = getattr(ram_tracking, "_rescue_identity_before_discontinuity_split", None)
+        self.assertIsNotNone(rescue)
+        rescue(
+            mask_stack=mask_stack,
+            identity_rescue_gap=1,
+            rescue_confidence_threshold=0.50,
+            max_centroid_dist_px=50.0,
+            audit_log=[],
+        )
+
+        normalized, rows, final_object_count = _prepare_challenge_tracks(
+            final_tracked_tensor=mask_stack,
+            division_cooldown_frames=20,
+            identity_rescue_gap=0,
+        )
+
+        self.assertEqual(final_object_count, max(row[0] for row in rows))
+        parent_rows = [row for row in rows if row[3] == 1]
+        self.assertEqual(len(parent_rows), 2)
+        for _, begin_frame, _, parent_id in parent_rows:
+            self.assertEqual(parent_id, 1)
+            self.assertGreater(begin_frame, 0)
+        self.assertFalse(np.any(normalized[:, :, 1:] == 1))
 
     def test_compact_labels_in_place_removes_sparse_raw_ids(self):
         mask_stack = np.zeros((2, 2, 2), dtype=np.uint32)
@@ -677,6 +798,113 @@ class CTCPipelineToolTests(unittest.TestCase):
         self.assertEqual(long[0], BlockRange(index=0, run_start=0, run_end=1099, owned_start=0, owned_end=999))
         self.assertEqual(long[1], BlockRange(index=1, run_start=900, run_end=2099, owned_start=1000, owned_end=1999))
         self.assertEqual(long[-1], BlockRange(index=27, run_start=26900, run_end=27000, owned_start=27000, owned_end=27000))
+
+    def test_blockwise_tracking_block_forwards_identity_rescue_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            mask = np.zeros((4, 4), dtype=np.uint16)
+            mask[1:3, 1:3] = 1
+            tifffile.imwrite(source / "mask000.tif", mask)
+            fake_tracker = root / "fake_tracker.py"
+            fake_tracker.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "print('ARGS=' + ' '.join(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                python=Path(sys.executable),
+                tracking_script=fake_tracker,
+                time_series_threshold=1,
+                output_digits="auto",
+                io_workers=1,
+                io_queue_depth=4,
+                tiff_write_workers=4,
+                identity_rescue_gap=1,
+                rescue_confidence_threshold=0.5,
+                max_centroid_dist_px=50.0,
+                stack_storage="ram",
+                mmap_dir=None,
+            )
+
+            blockwise_tiptracking._run_tracking_block(
+                block=BlockRange(0, 0, 0, 0, 0),
+                files=[source / "mask000.tif"],
+                block_work_root=root / "work",
+                args=args,
+            )
+
+            log = (root / "work" / "logs" / "block_0000.log").read_text(encoding="utf-8")
+            self.assertIn("--identity-rescue-gap 1", log)
+            self.assertIn("--rescue-confidence-threshold 0.5", log)
+            self.assertIn("--max-centroid-dist-px 50.0", log)
+
+    def test_blockwise_tiny_synthetic_run_validates_and_keeps_rescue_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mask_dir = root / "masks"
+            output_dir = root / "output"
+            mask_dir.mkdir()
+            for frame_idx in range(4):
+                mask = np.zeros((10, 10), dtype=np.uint16)
+                mask[2:6, 2 + (frame_idx % 2) : 6 + (frame_idx % 2)] = 1
+                tifffile.imwrite(mask_dir / f"mask{frame_idx:03d}.tif", mask)
+
+            blockwise_tiptracking.run_blockwise_tracking(
+                SimpleNamespace(
+                    mask_dir=mask_dir,
+                    mask_pattern="mask*.tif",
+                    output_dir=output_dir,
+                    position="01",
+                    tracking_script=Path("ram_run_tiptracking_standalone_optimized.py").resolve(),
+                    python=Path(sys.executable),
+                    block_size=2,
+                    overlap=1,
+                    jobs=1,
+                    min_iou=0.50,
+                    min_overlap_frames=1,
+                    time_series_threshold=1,
+                    output_digits="3",
+                    io_workers=1,
+                    io_queue_depth=2,
+                    tiff_write_workers=1,
+                    identity_rescue_gap=1,
+                    rescue_confidence_threshold=0.50,
+                    max_centroid_dist_px=50.0,
+                    stack_storage="ram",
+                    mmap_dir=None,
+                    export_mode="full",
+                    final_output_dir=None,
+                    source_root=None,
+                    sequence=None,
+                    source_frame_count=None,
+                    temporal_downsample_factor=1,
+                    temporal_downsample_offset=0,
+                    final_output_digits="auto",
+                    pad_missing_with_empty=False,
+                    keep_block_work=True,
+                )
+            )
+
+            validation = validate_ctc_result_format(
+                dataset_root=output_dir,
+                source_root=None,
+                sequence="01",
+                digits_arg="auto",
+            )
+            self.assertEqual(validation["frames"], 4)
+            self.assertEqual(validation["tracks"], 1)
+            audit = (
+                output_dir
+                / "01_blockwise_work"
+                / "tracking"
+                / "block_0000_RES"
+                / "identity_rescue_audit.csv"
+            )
+            self.assertTrue(audit.is_file())
+            self.assertIn("stage,event,frame,lost_id", audit.read_text(encoding="utf-8"))
 
     def test_blockwise_merge_stitches_same_object_across_overlap(self):
         with tempfile.TemporaryDirectory() as tmp:
