@@ -12,6 +12,8 @@ from identify_segmentation_break_frames import (
     BreakEvent,
     classify_break_events_with_masks,
     find_break_events,
+    load_label_size_matrix_from_masks,
+    load_mask_frame_source,
     load_all_ob_matrix,
     orient_loaded_matrix,
     reviewable_events,
@@ -156,6 +158,72 @@ class IdentifySegmentationBreakFramesTests(unittest.TestCase):
         self.assertEqual(decisions[0].review_category, "missing_detection_candidate")
         self.assertTrue(decisions[0].review_required)
         self.assertEqual([event.break_frame_0_based for event in reviewable_events(decisions)], [1])
+
+    def test_builds_break_candidates_from_masks_without_all_ob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mask_dir = Path(tmp) / "tracked_masks"
+            mask_dir.mkdir()
+            frames = [np.zeros((10, 10), dtype=np.uint16) for _ in range(4)]
+            frames[0][1:4, 1:4] = 1
+            frames[1][1:4, 1:4] = 2
+            frames[2][1:4, 1:4] = 2
+            frames[3][1:4, 1:4] = 2
+            frames[0][6:9, 6:9] = 5
+            frames[1][6:9, 6:9] = 5
+            frames[3][6:9, 6:9] = 5
+            for idx, frame in enumerate(frames):
+                tifffile.imwrite(mask_dir / f"mask{idx:03d}.tif", frame)
+
+            source = load_mask_frame_source(mask_dir)
+            loaded = load_label_size_matrix_from_masks(source)
+            events = find_break_events(loaded.matrix, track_ids=loaded.track_ids)
+            decisions = classify_break_events_with_masks(events, mask_dir=source)
+
+        self.assertEqual(loaded.track_ids, (1, 5, 2))
+        self.assertEqual([(event.track_id, event.break_frame_0_based) for event in events], [(1, 1), (5, 2)])
+        self.assertEqual([decision.review_category for decision in decisions], ["id_change", "missing_detection_candidate"])
+        self.assertEqual([(event.track_id, event.break_frame_0_based) for event in reviewable_events(decisions)], [(5, 2)])
+
+    def test_block_folder_mask_source_uses_owned_frames_without_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for block_idx in range(2):
+                block_dir = root / f"block_{block_idx:04d}_RES"
+                block_dir.mkdir()
+                for local_idx in range(4):
+                    frame = np.zeros((5, 5), dtype=np.uint16)
+                    frame[1:3, 1:3] = block_idx + 1
+                    tifffile.imwrite(block_dir / f"mask{local_idx:03d}.tif", frame)
+
+            source = load_mask_frame_source(root, layout="block-folders", block_size=2, overlap=1)
+
+        self.assertEqual([path.parent.name + "/" + path.name for path in source.files], [
+            "block_0000_RES/mask000.tif",
+            "block_0000_RES/mask001.tif",
+            "block_0001_RES/mask001.tif",
+            "block_0001_RES/mask002.tif",
+        ])
+
+    def test_block_folder_labels_are_namespaced_before_break_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for block_idx in range(2):
+                block_dir = root / f"block_{block_idx:04d}_RES"
+                block_dir.mkdir()
+                for local_idx in range(4):
+                    frame = np.zeros((6, 6), dtype=np.uint16)
+                    frame[1:4, 1:4] = 1
+                    tifffile.imwrite(block_dir / f"mask{local_idx:03d}.tif", frame)
+
+            source = load_mask_frame_source(root, layout="block-folders", block_size=2, overlap=1)
+            loaded = load_label_size_matrix_from_masks(source)
+            events = find_break_events(loaded.matrix, track_ids=loaded.track_ids)
+            decisions = classify_break_events_with_masks(events, mask_dir=source)
+
+        self.assertEqual(loaded.track_ids, (1000001, 2000001))
+        self.assertEqual([(event.track_id, event.break_frame_0_based) for event in events], [(1000001, 2)])
+        self.assertEqual([decision.review_category for decision in decisions], ["id_change"])
+        self.assertEqual(reviewable_events(decisions), [])
 
 
 if __name__ == "__main__":

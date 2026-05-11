@@ -56,6 +56,7 @@ TRACKING_TIFF_WRITE_WORKERS=4
 TRACKING_IDENTITY_RESCUE_GAP=1
 TRACKING_RESCUE_CONFIDENCE_THRESHOLD="0.50"
 TRACKING_MAX_CENTROID_DIST_PX="50"
+TRACKING_GAP_FILL_FRAMES=1
 TRACKING_EXPORT_MODE="final-only"
 TRACKING_BLOCKWISE=0
 TRACKING_BLOCK_SIZE=1000
@@ -143,6 +144,8 @@ Tracking/downsampling options:
                             Minimum identity rescue score in [0,1]. Default: 0.50.
   --tracking-max-centroid-dist-px N
                             Hard centroid-distance limit for identity rescue. Default: 50.
+  --tracking-gap-fill-frames N
+                            Fill short internal segmentation dropouts before CTC export. Default: 1.
   --tracking-export-mode MODE
                             final-only or full. Default: final-only.
   --tracking-block-size N   Enable blockwise tracking with N owned frames per block.
@@ -684,6 +687,7 @@ parse_args() {
       --tracking-identity-rescue-gap) TRACKING_IDENTITY_RESCUE_GAP="${2:?}"; shift 2 ;;
       --tracking-rescue-confidence-threshold) TRACKING_RESCUE_CONFIDENCE_THRESHOLD="${2:?}"; shift 2 ;;
       --tracking-max-centroid-dist-px) TRACKING_MAX_CENTROID_DIST_PX="${2:?}"; shift 2 ;;
+      --tracking-gap-fill-frames) TRACKING_GAP_FILL_FRAMES="${2:?}"; shift 2 ;;
       --tracking-export-mode) TRACKING_EXPORT_MODE="${2:?}"; shift 2 ;;
       --tracking-block-size) TRACKING_BLOCKWISE=1; TRACKING_BLOCK_SIZE="${2:?}"; shift 2 ;;
       --tracking-block-overlap) TRACKING_BLOCKWISE=1; TRACKING_BLOCK_OVERLAP="${2:?}"; shift 2 ;;
@@ -749,6 +753,9 @@ validate_args() {
   fi
   if ! [[ "$TRACKING_IDENTITY_RESCUE_GAP" =~ ^[0-9]+$ ]]; then
     die "--tracking-identity-rescue-gap must be a non-negative integer"
+  fi
+  if ! [[ "$TRACKING_GAP_FILL_FRAMES" =~ ^[0-9]+$ ]]; then
+    die "--tracking-gap-fill-frames must be a non-negative integer"
   fi
   case "$TRACKING_EXPORT_MODE" in
     final-only|full)
@@ -892,6 +899,7 @@ run_sequence() {
       --identity-rescue-gap "$TRACKING_IDENTITY_RESCUE_GAP" \
       --rescue-confidence-threshold "$TRACKING_RESCUE_CONFIDENCE_THRESHOLD" \
       --max-centroid-dist-px "$TRACKING_MAX_CENTROID_DIST_PX" \
+      --gap-fill-frames "$TRACKING_GAP_FILL_FRAMES" \
       --stack-storage "$TRACKING_STACK_STORAGE" \
       --export-mode "$effective_tracking_export_mode"
     )

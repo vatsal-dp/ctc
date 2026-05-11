@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tifffile
 
-from validate_ctc_result_format import _normalize_sequence, _natural_sort_key, resolve_digits
+from ctc_tracking.evaluation.validate_ctc_result_format import _normalize_sequence, _natural_sort_key, resolve_digits
 
 
 def _indexed_files(folder: Path, prefix: str, digits: int):

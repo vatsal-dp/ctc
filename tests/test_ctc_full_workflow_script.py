@@ -8,7 +8,8 @@ import shlex
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parent / "run_ctc_full_workflow.sh"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = REPO_ROOT / "run_ctc_full_workflow.sh"
 
 
 class CTCFullWorkflowScriptTests(unittest.TestCase):
@@ -38,6 +39,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
         self.assertIn("--tracking-identity-rescue-gap", result.stdout)
         self.assertIn("--tracking-rescue-confidence-threshold", result.stdout)
         self.assertIn("--tracking-max-centroid-dist-px", result.stdout)
+        self.assertIn("--tracking-gap-fill-frames", result.stdout)
 
     def test_help_documents_environment_bootstrap_options(self):
         result = subprocess.run(
@@ -57,7 +59,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
 
     def test_requirements_include_workflow_runtime_dependencies(self):
         requirements = (
-            SCRIPT.parent / "requirements.txt"
+            REPO_ROOT / "requirements.txt"
         ).read_text(encoding="utf-8").splitlines()
         packages = {
             line.strip().lower().split("<", 1)[0]
@@ -132,6 +134,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn("python -m cellpose", result.stdout)
             self.assertIn("ram_run_tiptracking_standalone_optimized.py", result.stdout)
             self.assertIn("--stack-storage ram", result.stdout)
+            self.assertIn("--gap-fill-frames 1", result.stdout)
             self.assertIn("--export-mode final-only", result.stdout)
             self.assertIn("--temporal-downsample-factor 2", result.stdout)
             self.assertIn("--final-output-dir", result.stdout)
@@ -355,6 +358,8 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
                     "0.50",
                     "--tracking-max-centroid-dist-px",
                     "50",
+                    "--tracking-gap-fill-frames",
+                    "2",
                     "--dry-run",
                 ],
                 check=False,
@@ -372,6 +377,7 @@ class CTCFullWorkflowScriptTests(unittest.TestCase):
             self.assertIn("--identity-rescue-gap 1", result.stdout)
             self.assertIn("--rescue-confidence-threshold 0.50", result.stdout)
             self.assertIn("--max-centroid-dist-px 50", result.stdout)
+            self.assertIn("--gap-fill-frames 2", result.stdout)
             self.assertIn("--tracking-script", result.stdout)
             self.assertIn("ram_run_tiptracking_standalone_optimized.py", result.stdout)
             self.assertIn("--export-mode final-only", result.stdout)

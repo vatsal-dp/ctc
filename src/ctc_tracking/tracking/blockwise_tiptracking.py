@@ -21,14 +21,14 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
-from export_ctc_res_from_tracked_masks import (
+from ctc_tracking.tracking.export_ctc_res_from_tracked_masks import (
     _build_frame_maps,
     _build_track_runs,
     _parse_output_digits,
     _prepare_output_dir,
     _scan_label_frames,
 )
-from temporal_downsample_ctc_results import _relabel_mask, temporal_downsample_ctc_results
+from ctc_tracking.tracking.temporal_downsample_ctc_results import _relabel_mask, temporal_downsample_ctc_results
 
 
 IMAGE_SUFFIXES = {".tif", ".tiff"}
@@ -492,6 +492,8 @@ def _run_tracking_block(
         str(args.rescue_confidence_threshold),
         "--max-centroid-dist-px",
         str(args.max_centroid_dist_px),
+        "--gap-fill-frames",
+        str(getattr(args, "gap_fill_frames", 0)),
         "--stack-storage",
         args.stack_storage,
         "--export-mode",
@@ -600,7 +602,7 @@ def run_blockwise_tracking(args):
 
 
 def parse_args():
-    script_dir = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser(
         description="Run tip tracking in overlapping blocks and stitch into one CTC result."
     )
@@ -608,7 +610,7 @@ def parse_args():
     parser.add_argument("--mask-pattern", default=None, help="Input mask glob/suffix, e.g. '*_cp_masks.tif'.")
     parser.add_argument("--output-dir", required=True, type=Path, help="Tracking output root.")
     parser.add_argument("--position", required=True, help="Output prefix; writes <position>_RES.")
-    parser.add_argument("--tracking-script", default=script_dir / "ram_run_tiptracking_standalone_optimized.py", type=Path)
+    parser.add_argument("--tracking-script", default=repo_root / "ram_run_tiptracking_standalone_optimized.py", type=Path)
     parser.add_argument("--python", default=Path(sys.executable), type=Path, help="Python executable for block tracker runs.")
     parser.add_argument("--block-size", default=1000, type=int, help="Owned frames per block. Default: 1000.")
     parser.add_argument("--overlap", default=100, type=int, help="Extra frames on each side of a block run. Default: 100.")
@@ -623,6 +625,7 @@ def parse_args():
     parser.add_argument("--identity-rescue-gap", default=1, type=int)
     parser.add_argument("--rescue-confidence-threshold", default=0.50, type=float)
     parser.add_argument("--max-centroid-dist-px", default=50.0, type=float)
+    parser.add_argument("--gap-fill-frames", default=0, type=int)
     parser.add_argument("--stack-storage", choices=["ram", "mmap"], default="ram")
     parser.add_argument("--mmap-dir", default=None, type=Path)
     parser.add_argument("--export-mode", choices=["full", "final-only"], default="full")
@@ -657,6 +660,8 @@ def _validate_args(args):
         raise ValueError("--rescue-confidence-threshold must be in the range [0, 1].")
     if args.max_centroid_dist_px < 0:
         raise ValueError("--max-centroid-dist-px must be >= 0.")
+    if args.gap_fill_frames < 0:
+        raise ValueError("--gap-fill-frames must be >= 0.")
     if not args.tracking_script.is_file():
         raise FileNotFoundError(f"tracking-script does not exist: {args.tracking_script}")
     if args.mmap_dir is not None and args.stack_storage != "mmap":

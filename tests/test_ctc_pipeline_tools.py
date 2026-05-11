@@ -345,6 +345,69 @@ class CTCPipelineToolTests(unittest.TestCase):
         self.assertEqual(mask_stack.reshape(-1).tolist().count(2), 25)
         self.assertTrue([entry for entry in audit_log if entry["event"] == "rescued"])
 
+    def test_ram_gap_fill_prevents_one_frame_detection_dropout_from_splitting_track(self):
+        mask_stack = np.zeros((10, 10, 3), dtype=np.uint16)
+        mask_stack[2:7, 2:7, 0] = 1
+        mask_stack[2:7, 2:7, 2] = 1
+
+        gap_fill = getattr(ram_tracking, "_fill_short_track_gaps", None)
+        self.assertIsNotNone(gap_fill)
+        report = gap_fill(mask_stack=mask_stack, max_gap_frames=1)
+        max_id = int(np.max(mask_stack)) if mask_stack.size else 0
+        tp_im = ram_tracking._build_tp_im(mask_stack, max_id) if max_id > 0 else np.zeros((0, 0), dtype=np.uint32)
+        tp1 = tp_im != 0
+        tp_im, tp1, short_pruned, capacity_pruned = _split_discontinuous_tracks_ram(
+            mask_stack=mask_stack,
+            tp_im=tp_im,
+            tp1=tp1,
+            time_series_threshold=1,
+        )
+
+        self.assertEqual(report["filled_gaps"], 1)
+        self.assertEqual(report["filled_frames"], 1)
+        self.assertEqual(short_pruned, 0)
+        self.assertEqual(capacity_pruned, 0)
+        self.assertEqual(int(np.count_nonzero(np.any(tp1, axis=1))), 1)
+        self.assertEqual(set(np.unique(mask_stack[:, :, 1]).tolist()), {0, 1})
+
+    def test_ram_run_tracking_gap_fill_keeps_dropout_as_one_exported_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mask_dir = root / "masks"
+            output_dir = root / "tracking"
+            mask_dir.mkdir()
+            for frame_idx in range(3):
+                mask = np.zeros((10, 10), dtype=np.uint16)
+                if frame_idx != 1:
+                    mask[2:7, 2:7] = 1
+                tifffile.imwrite(mask_dir / f"mask{frame_idx:03d}.tif", mask)
+
+            ram_tracking.run_tracking(
+                mask_dir=mask_dir,
+                output_dir=output_dir,
+                pos="01",
+                mask_pattern="mask*.tif",
+                time_series_threshold=1,
+                down_factor=1,
+                resiz_factor=1.0,
+                strict_matlab_id_matching=True,
+                output_digits="3",
+                division_cooldown_frames=20,
+                identity_rescue_gap=0,
+                rescue_confidence_threshold=0.50,
+                max_centroid_dist_px=50.0,
+                io_workers=1,
+                io_queue_depth=2,
+                tiff_write_workers=1,
+                stack_storage="ram",
+                export_mode="full",
+                gap_fill_frames=1,
+            )
+
+            result_dir = output_dir / "01_RES"
+            self.assertEqual((result_dir / "res_track.txt").read_text(encoding="utf-8"), "1 0 2 0\n")
+            self.assertEqual(set(np.unique(tifffile.imread(result_dir / "mask001.tif")).tolist()), {0, 1})
+
     def test_ram_pre_split_rescue_preserves_division_parent_rows(self):
         mask_stack = self._division_stack(frame_count=3)
         mask_stack[5:8, 2:8, 2] = 0
@@ -825,6 +888,7 @@ class CTCPipelineToolTests(unittest.TestCase):
                 identity_rescue_gap=1,
                 rescue_confidence_threshold=0.5,
                 max_centroid_dist_px=50.0,
+                gap_fill_frames=2,
                 stack_storage="ram",
                 mmap_dir=None,
             )
@@ -840,6 +904,7 @@ class CTCPipelineToolTests(unittest.TestCase):
             self.assertIn("--identity-rescue-gap 1", log)
             self.assertIn("--rescue-confidence-threshold 0.5", log)
             self.assertIn("--max-centroid-dist-px 50.0", log)
+            self.assertIn("--gap-fill-frames 2", log)
 
     def test_blockwise_tiny_synthetic_run_validates_and_keeps_rescue_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1415,7 +1480,7 @@ class CTCPipelineToolTests(unittest.TestCase):
             )
 
             self.assertEqual(_tracking_position_for_sequence("01", 16), "01_interp")
-            _run_sequence(args, Path(__file__).resolve().parent, "01")
+            _run_sequence(args, Path(__file__).resolve().parents[1], "01")
 
             tracking_log = (log_dir / "01_tracking.log").read_text(encoding="utf-8")
             downsample_log = (log_dir / "01_temporal_downsample.log").read_text(encoding="utf-8")
