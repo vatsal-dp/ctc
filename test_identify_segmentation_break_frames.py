@@ -6,11 +6,15 @@ from pathlib import Path
 
 import numpy as np
 import scipy.io as sio
+import tifffile
 
 from identify_segmentation_break_frames import (
     BreakEvent,
+    classify_break_events_with_masks,
     find_break_events,
     load_all_ob_matrix,
+    orient_loaded_matrix,
+    reviewable_events,
     unique_review_frames,
 )
 
@@ -83,6 +87,75 @@ class IdentifySegmentationBreakFramesTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded.matrix, expected)
         self.assertEqual(loaded.name, "all_ob")
         self.assertEqual(loaded.source_path, mat_path)
+
+    def test_auto_orientation_transposes_when_rows_match_tracked_mask_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mask_dir = root / "tracked_masks"
+            mask_dir.mkdir()
+            for frame in range(5):
+                (mask_dir / f"mask{frame:03d}.tif").write_bytes(b"not a real tif; only counted")
+
+            mat_path = root / "tracks.mat"
+            frames_by_tracks = np.array(
+                [
+                    [5, 0],
+                    [5, 0],
+                    [0, 2],
+                    [0, 2],
+                    [0, 0],
+                ],
+                dtype=np.uint32,
+            )
+            sio.savemat(mat_path, {"all_ob": frames_by_tracks})
+
+            loaded = orient_loaded_matrix(load_all_ob_matrix(mat_path), source=root)
+
+        self.assertEqual(loaded.matrix.shape, (2, 5))
+        self.assertEqual(loaded.name, "all_ob.T")
+        self.assertEqual([event.break_frame_0_based for event in find_break_events(loaded.matrix)], [2])
+
+    def test_mask_classification_excludes_simple_id_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mask_dir = Path(tmp) / "tracked_masks"
+            mask_dir.mkdir()
+            frame0 = np.zeros((8, 8), dtype=np.uint16)
+            frame1 = np.zeros((8, 8), dtype=np.uint16)
+            frame2 = np.zeros((8, 8), dtype=np.uint16)
+            frame0[2:5, 2:5] = 1
+            frame1[2:5, 2:5] = 2
+            frame2[2:5, 2:5] = 2
+            for idx, frame in enumerate([frame0, frame1, frame2]):
+                tifffile.imwrite(mask_dir / f"mask{idx:03d}.tif", frame)
+
+            all_ob = np.array([[9, 0, 0], [0, 9, 9]], dtype=np.uint32)
+            decisions = classify_break_events_with_masks(find_break_events(all_ob), mask_dir=mask_dir)
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].review_category, "id_change")
+        self.assertFalse(decisions[0].review_required)
+        self.assertEqual(decisions[0].replacement_track_id, 2)
+        self.assertEqual(reviewable_events(decisions), [])
+
+    def test_mask_classification_keeps_missing_detection_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mask_dir = Path(tmp) / "tracked_masks"
+            mask_dir.mkdir()
+            frame0 = np.zeros((8, 8), dtype=np.uint16)
+            frame1 = np.zeros((8, 8), dtype=np.uint16)
+            frame2 = np.zeros((8, 8), dtype=np.uint16)
+            frame0[2:5, 2:5] = 1
+            frame2[2:5, 2:5] = 1
+            for idx, frame in enumerate([frame0, frame1, frame2]):
+                tifffile.imwrite(mask_dir / f"mask{idx:03d}.tif", frame)
+
+            all_ob = np.array([[9, 0, 9]], dtype=np.uint32)
+            decisions = classify_break_events_with_masks(find_break_events(all_ob), mask_dir=mask_dir)
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].review_category, "missing_detection_candidate")
+        self.assertTrue(decisions[0].review_required)
+        self.assertEqual([event.break_frame_0_based for event in reviewable_events(decisions)], [1])
 
 
 if __name__ == "__main__":
